@@ -1,0 +1,12 @@
+{
+  "name": "ffmpeg-video-assembly",
+  "version": "1.0.0",
+  "description": "FFmpeg microservice for Ambient AI Video Factory — assembles slideshow MP4 from images + audio",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
