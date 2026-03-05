@@ -1,7 +1,7 @@
 {
   "name": "ffmpeg-video-assembly",
-  "version": "2.0.0",
-  "description": "FFmpeg video assembly microservice for Ambient AI Video Factory",
+  "version": "3.0.0",
+  "description": "FFmpeg video assembly microservice - generates images, assembles video",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
