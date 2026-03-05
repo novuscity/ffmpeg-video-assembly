@@ -111,7 +111,7 @@ app.post('/render', async (req, res) => {
     const resolution = output.resolution || '1920x1080';
     const [width, height] = resolution.split('x').map(Number);
     const fps = output.fps || 24;
-    const imageSize = output.imageSize || '1536x1024';
+    const imageSize = output.imageSize || '1024x1024';
     const imageQuality = output.imageQuality || 'low';
 
     console.log(`[${jobId}] Starting render: ${tracks.length} tracks`);
@@ -157,6 +157,17 @@ app.post('/render', async (req, res) => {
       imagePaths.push({ path: imgPath, durationSeconds: trackPaths[i]?.durationSeconds || 240 });
     }
 
+    // ── Step 2b: Convert PNGs to pre-scaled JPEGs (saves memory during encoding) ──
+    console.log(`[${jobId}] Pre-scaling images to ${width}x${height}...`);
+    for (let i = 0; i < imagePaths.length; i++) {
+      const jpgPath = imagePaths[i].path.replace('.png', '_scaled.jpg');
+      execSync(
+        `ffmpeg -y -i "${imagePaths[i].path}" -vf "scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black" -q:v 2 "${jpgPath}"`,
+        { stdio: 'pipe', timeout: 30000 }
+      );
+      imagePaths[i].path = jpgPath;
+    }
+
     // ── Step 3: Concatenate audio ──
     console.log(`[${jobId}] Concatenating audio...`);
     let audioOutputPath;
@@ -192,14 +203,14 @@ app.post('/render', async (req, res) => {
     execSync(
       `ffmpeg -y -f concat -safe 0 -i "${concatFile}" ` +
       `-i "${audioOutputPath}" ` +
-      `-vf "scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black,fps=${fps}" ` +
-      `-c:v libx264 -preset medium -crf 23 -pix_fmt yuv420p ` +
-      `-c:a aac -b:a 192k ` +
+      `-vf "fps=${fps}" ` +
+      `-c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -threads 2 ` +
+      `-c:a aac -b:a 128k ` +
       `-t ${audioDuration} ` +
       `-shortest ` +
       `-movflags +faststart ` +
       `"${outputPath}"`,
-      { stdio: 'pipe', timeout: 900000 }
+      { stdio: 'pipe', timeout: 900000, maxBuffer: 50 * 1024 * 1024 }
     );
 
     const stats = fs.statSync(outputPath);
