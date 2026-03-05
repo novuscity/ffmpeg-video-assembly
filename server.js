@@ -1,5 +1,5 @@
 const express = require('express');
-const { execSync, execFileSync } = require('child_process');
+const { execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const https = require('https');
@@ -9,30 +9,29 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Increase body size limit for base64 images (each ~2-4MB)
-app.use(express.json({ limit: '200mb' }));
+app.use(express.json({ limit: '50mb' }));
 
-// Health check
+// ============================================================
+// HEALTH CHECK
+// ============================================================
 app.get('/health', (req, res) => {
   let ffmpegOk = false;
-  try {
-    execSync('ffmpeg -version', { stdio: 'pipe' });
-    ffmpegOk = true;
-  } catch (e) { /* */ }
-  res.json({ status: 'ok', ffmpeg: ffmpegOk });
+  try { execSync('ffmpeg -version', { stdio: 'pipe' }); ffmpegOk = true; } catch (e) {}
+  res.json({ status: 'ok', ffmpeg: ffmpegOk, version: '3.0.0' });
 });
 
-// Download a file from URL to local path
+// ============================================================
+// HELPERS
+// ============================================================
 function downloadFile(url, destPath) {
   return new Promise((resolve, reject) => {
     const proto = url.startsWith('https') ? https : http;
     const request = proto.get(url, { timeout: 120000 }, (response) => {
       if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        // Follow redirect
         return downloadFile(response.headers.location, destPath).then(resolve).catch(reject);
       }
       if (response.statusCode !== 200) {
-        return reject(new Error(`HTTP ${response.statusCode} downloading ${url}`));
+        return reject(new Error(`HTTP ${response.statusCode} downloading ${url.slice(0, 80)}`));
       }
       const file = fs.createWriteStream(destPath);
       response.pipe(file);
@@ -44,124 +43,152 @@ function downloadFile(url, destPath) {
   });
 }
 
-// Save base64 data to a file
-function saveBase64ToFile(base64Data, destPath) {
-  // Strip data URI prefix if present
-  let raw = base64Data;
-  if (raw.startsWith('data:')) {
-    raw = raw.split(',')[1] || raw;
-  }
-  const buffer = Buffer.from(raw, 'base64');
-  fs.writeFileSync(destPath, buffer);
+function saveBase64ToFile(b64, destPath) {
+  let raw = b64;
+  if (raw.startsWith('data:')) raw = raw.split(',')[1] || raw;
+  fs.writeFileSync(destPath, Buffer.from(raw, 'base64'));
   return destPath;
 }
 
-// Resolve an image source: either download URL or decode base64
-async function resolveImage(imageObj, destPath) {
-  if (imageObj.url && imageObj.url.startsWith('http')) {
-    return downloadFile(imageObj.url, destPath);
-  }
-  if (imageObj.b64 || imageObj.base64 || imageObj.b64_json) {
-    const data = imageObj.b64 || imageObj.base64 || imageObj.b64_json;
-    return saveBase64ToFile(data, destPath);
-  }
-  if (imageObj.url && imageObj.url.startsWith('data:')) {
-    // Data URI
-    const raw = imageObj.url.split(',')[1];
-    return saveBase64ToFile(raw, destPath);
-  }
-  throw new Error('Image has no url, b64, base64, or b64_json field');
+async function generateImage(prompt, destPath, apiKey, size = '1536x1024', quality = 'low') {
+  const body = JSON.stringify({
+    model: 'gpt-image-1',
+    prompt,
+    n: 1,
+    size,
+    quality,
+    output_format: 'png'
+  });
+
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: 'api.openai.com',
+      path: '/v1/images/generations',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Length': Buffer.byteLength(body)
+      },
+      timeout: 120000
+    }, (res) => {
+      let data = '';
+      res.on('data', chunk => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (parsed.error) return reject(new Error(parsed.error.message));
+          const b64 = parsed.data?.[0]?.b64_json;
+          if (!b64) return reject(new Error('No b64_json in OpenAI response'));
+          saveBase64ToFile(b64, destPath);
+          resolve(destPath);
+        } catch (e) { reject(new Error('Failed to parse OpenAI response: ' + e.message)); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('OpenAI request timeout')); });
+    req.write(body);
+    req.end();
+  });
 }
 
-// Main render endpoint
+// ============================================================
+// MAIN RENDER ENDPOINT (v3 — generates images server-side)
+// ============================================================
 app.post('/render', async (req, res) => {
   const jobId = crypto.randomBytes(8).toString('hex');
   const workDir = path.join('/tmp', `job-${jobId}`);
-  
+
   try {
     fs.mkdirSync(workDir, { recursive: true });
-    
-    const { images, tracks, crossfadeSec = 2, output = {} } = req.body;
-    
-    if (!images || !Array.isArray(images) || images.length === 0) {
-      return res.status(400).json({ error: 'No images provided' });
-    }
+
+    const { tracks, imagePrompts, openaiApiKey, crossfadeSec = 2, output = {} } = req.body;
+
     if (!tracks || !Array.isArray(tracks) || tracks.length === 0) {
-      return res.status(400).json({ error: 'No audio tracks provided' });
+      return res.status(400).json({ error: 'No tracks provided' });
     }
-    
+
     const resolution = output.resolution || '1920x1080';
     const [width, height] = resolution.split('x').map(Number);
     const fps = output.fps || 24;
-    
-    console.log(`[${jobId}] Starting render: ${images.length} images, ${tracks.length} tracks`);
-    
-    // Step 1: Download/decode all images
-    console.log(`[${jobId}] Downloading/decoding images...`);
-    const imagePaths = [];
-    for (let i = 0; i < images.length; i++) {
-      const ext = 'png';
-      const imgPath = path.join(workDir, `img_${String(i).padStart(3, '0')}.${ext}`);
-      await resolveImage(images[i], imgPath);
-      imagePaths.push({ path: imgPath, durationSeconds: images[i].durationSeconds || 240 });
-      console.log(`[${jobId}] Image ${i + 1}/${images.length} ready`);
-    }
-    
-    // Step 2: Download all audio tracks
-    console.log(`[${jobId}] Downloading audio tracks...`);
+    const imageSize = output.imageSize || '1536x1024';
+    const imageQuality = output.imageQuality || 'low';
+
+    console.log(`[${jobId}] Starting render: ${tracks.length} tracks`);
+
+    // ── Step 1: Download audio tracks ──
+    console.log(`[${jobId}] Downloading ${tracks.length} audio tracks...`);
     const trackPaths = [];
     for (let i = 0; i < tracks.length; i++) {
       const audioPath = path.join(workDir, `track_${String(i).padStart(3, '0')}.mp3`);
       await downloadFile(tracks[i].url, audioPath);
       trackPaths.push({ path: audioPath, durationSeconds: tracks[i].durationSeconds || 240 });
-      console.log(`[${jobId}] Track ${i + 1}/${tracks.length} ready`);
+      console.log(`[${jobId}]   Track ${i + 1}/${tracks.length} downloaded`);
     }
-    
-    // Step 3: Build FFmpeg slideshow from images
-    // Create a concat file for images with durations
-    console.log(`[${jobId}] Building slideshow...`);
-    const concatContent = imagePaths.map(img => 
-      `file '${img.path}'\nduration ${img.durationSeconds}`
-    ).join('\n') + `\nfile '${imagePaths[imagePaths.length - 1].path}'`; // last image repeated for concat demuxer
-    
-    const concatFile = path.join(workDir, 'images.txt');
-    fs.writeFileSync(concatFile, concatContent);
-    
-    // Step 4: Concatenate audio tracks with crossfade
+
+    // ── Step 2: Generate or download images ──
+    const imagePaths = [];
+    const prompts = imagePrompts || [];
+
+    for (let i = 0; i < tracks.length; i++) {
+      const imgPath = path.join(workDir, `img_${String(i).padStart(3, '0')}.png`);
+
+      if (tracks[i].imageUrl && tracks[i].imageUrl.startsWith('http')) {
+        // Pre-generated image URL
+        console.log(`[${jobId}]   Image ${i + 1}: downloading from URL...`);
+        await downloadFile(tracks[i].imageUrl, imgPath);
+      } else if (tracks[i].imageB64) {
+        // Pre-generated base64
+        console.log(`[${jobId}]   Image ${i + 1}: decoding base64...`);
+        saveBase64ToFile(tracks[i].imageB64, imgPath);
+      } else if (prompts[i] && openaiApiKey) {
+        // Generate on the server
+        console.log(`[${jobId}]   Image ${i + 1}: generating via OpenAI...`);
+        await generateImage(prompts[i], imgPath, openaiApiKey, imageSize, imageQuality);
+        console.log(`[${jobId}]   Image ${i + 1}: generated!`);
+      } else {
+        // Fallback: solid color placeholder
+        console.log(`[${jobId}]   Image ${i + 1}: generating placeholder...`);
+        const colors = ['#2d1b0e', '#1a2e1a', '#0e1b2d', '#2d0e1b', '#1b2d0e'];
+        const color = colors[i % colors.length];
+        execSync(`ffmpeg -y -f lavfi -i "color=c=${color}:s=${width}x${height}:d=1" -frames:v 1 "${imgPath}"`,
+          { stdio: 'pipe', timeout: 10000 });
+      }
+      imagePaths.push({ path: imgPath, durationSeconds: trackPaths[i]?.durationSeconds || 240 });
+    }
+
+    // ── Step 3: Concatenate audio ──
     console.log(`[${jobId}] Concatenating audio...`);
     let audioOutputPath;
-    
     if (trackPaths.length === 1) {
       audioOutputPath = trackPaths[0].path;
     } else {
-      // Build complex filter for audio crossfade
-      const audioInputs = trackPaths.map((t, i) => `-i "${t.path}"`).join(' ');
-      
-      // Simple concat (crossfade is complex with many tracks, use concat filter)
       const audioListFile = path.join(workDir, 'audio_list.txt');
-      const audioListContent = trackPaths.map(t => `file '${t.path}'`).join('\n');
-      fs.writeFileSync(audioListFile, audioListContent);
-      
+      fs.writeFileSync(audioListFile, trackPaths.map(t => `file '${t.path}'`).join('\n'));
       audioOutputPath = path.join(workDir, 'combined_audio.mp3');
-      execSync(
-        `ffmpeg -y -f concat -safe 0 -i "${audioListFile}" -c:a libmp3lame -q:a 2 "${audioOutputPath}"`,
-        { stdio: 'pipe', timeout: 300000 }
-      );
-      console.log(`[${jobId}] Audio concatenated`);
+      execSync(`ffmpeg -y -f concat -safe 0 -i "${audioListFile}" -c:a libmp3lame -q:a 2 "${audioOutputPath}"`,
+        { stdio: 'pipe', timeout: 300000 });
     }
-    
-    // Step 5: Get audio duration to match video length
+
+    // ── Step 4: Get audio duration ──
     const probeResult = execSync(
       `ffprobe -v error -show_entries format=duration -of csv=p=0 "${audioOutputPath}"`,
       { stdio: 'pipe', timeout: 30000 }
     ).toString().trim();
     const audioDuration = parseFloat(probeResult) || 3600;
-    console.log(`[${jobId}] Audio duration: ${audioDuration}s`);
-    
-    // Step 6: Assemble final video (slideshow + audio)
+    console.log(`[${jobId}] Total audio duration: ${audioDuration}s`);
+
+    // ── Step 5: Build slideshow ──
+    console.log(`[${jobId}] Building slideshow...`);
+    const concatContent = imagePaths.map(img =>
+      `file '${img.path}'\nduration ${img.durationSeconds}`
+    ).join('\n') + `\nfile '${imagePaths[imagePaths.length - 1].path}'`;
+    const concatFile = path.join(workDir, 'images.txt');
+    fs.writeFileSync(concatFile, concatContent);
+
+    // ── Step 6: Assemble final video ──
     console.log(`[${jobId}] Assembling final video...`);
     const outputPath = path.join(workDir, `output_${jobId}.mp4`);
-    
     execSync(
       `ffmpeg -y -f concat -safe 0 -i "${concatFile}" ` +
       `-i "${audioOutputPath}" ` +
@@ -172,32 +199,22 @@ app.post('/render', async (req, res) => {
       `-shortest ` +
       `-movflags +faststart ` +
       `"${outputPath}"`,
-      { stdio: 'pipe', timeout: 900000 } // 15 min timeout
+      { stdio: 'pipe', timeout: 900000 }
     );
-    
-    console.log(`[${jobId}] Video assembled!`);
-    
-    // Step 7: Get file size
+
     const stats = fs.statSync(outputPath);
     const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(1);
-    console.log(`[${jobId}] Output size: ${fileSizeMB}MB`);
-    
-    // Step 8: Return the video as a download or serve it
-    // For now, serve it directly. In production, upload to cloud storage.
+    console.log(`[${jobId}] Done! ${fileSizeMB}MB`);
+
+    // Serve video via download endpoint
     const videoUrl = `https://${req.headers.host}/download/${jobId}`;
-    
-    // Store the path for the download endpoint
     app.locals[`job_${jobId}`] = outputPath;
-    
-    // Clean up after 30 minutes
+
+    // Clean up after 30 min
     setTimeout(() => {
-      try {
-        fs.rmSync(workDir, { recursive: true, force: true });
-        delete app.locals[`job_${jobId}`];
-        console.log(`[${jobId}] Cleaned up`);
-      } catch (e) { /* */ }
+      try { fs.rmSync(workDir, { recursive: true, force: true }); delete app.locals[`job_${jobId}`]; } catch (e) {}
     }, 30 * 60 * 1000);
-    
+
     res.json({
       status: 'complete',
       url: videoUrl,
@@ -205,19 +222,20 @@ app.post('/render', async (req, res) => {
       jobId,
       duration: audioDuration,
       fileSizeMB: parseFloat(fileSizeMB),
-      imageCount: images.length,
-      trackCount: tracks.length
+      trackCount: tracks.length,
+      imageCount: imagePaths.length
     });
-    
+
   } catch (err) {
     console.error(`[${jobId}] Error:`, err.message);
-    // Clean up on error
-    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch (e) { /* */ }
+    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch (e) {}
     res.status(500).json({ error: err.message, jobId });
   }
 });
 
-// Download endpoint - serves the rendered video
+// ============================================================
+// DOWNLOAD ENDPOINT
+// ============================================================
 app.get('/download/:jobId', (req, res) => {
   const outputPath = app.locals[`job_${req.params.jobId}`];
   if (!outputPath || !fs.existsSync(outputPath)) {
@@ -229,5 +247,5 @@ app.get('/download/:jobId', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`FFmpeg Video Assembly service running on port ${PORT}`);
+  console.log(`FFmpeg Video Assembly v3.0 running on port ${PORT}`);
 });
