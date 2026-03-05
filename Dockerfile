@@ -7,6 +7,7 @@ RUN apt-get update && \
 
 WORKDIR /app
 COPY package.json server.js ./
+RUN npm install --production
 
 ENV PORT=3000
 EXPOSE 3000
