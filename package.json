@@ -1,12 +1,14 @@
 {
   "name": "ffmpeg-video-assembly",
-  "version": "3.0.0",
+  "version": "3.1.0",
   "description": "FFmpeg video assembly microservice - generates images, assembles video",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "openai": "^4.0.0",
+    "axios": "^1.6.0"
   }
 }
