@@ -1,262 +1,342 @@
+/**
+ * Railway FFmpeg Service Patch Draft — candidate server.js
+ *
+ * Purpose:
+ * - Accept render requests where each track carries its own imagePrompt.
+ * - Generate one image per track.
+ * - Pair each image with its corresponding audio segment.
+ * - Concatenate or crossfade the segments into one MP4.
+ * - Return a stable response contract that n8n can consume.
+ *
+ * IMPORTANT:
+ * - This is a production-oriented draft for Opus 4.6 to audit before merge.
+ * - It assumes an Express app, ffmpeg/ffprobe availability, and writable temp storage.
+ * - It preserves gpt-image-1 as the default model to match the current project docs,
+ *   but allows OPENAI_IMAGE_MODEL to be overridden later.
+ */
+
 const express = require('express');
-const { execSync } = require('child_process');
 const fs = require('fs');
+const fsp = require('fs/promises');
+const os = require('os');
 const path = require('path');
-const https = require('https');
-const http = require('http');
 const crypto = require('crypto');
+const axios = require('axios');
+const { execFile } = require('child_process');
+const util = require('util');
+const OpenAI = require('openai');
 
+const execFileAsync = util.promisify(execFile);
 const app = express();
+app.use(express.json({ limit: '2mb' }));
+
 const PORT = process.env.PORT || 3000;
+const BASE_URL = process.env.PUBLIC_BASE_URL || process.env.RAILWAY_STATIC_URL || '';
+const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR || path.join(process.cwd(), 'downloads');
+const OPENAI_IMAGE_MODEL = process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1';
+const FFMPEG_BIN = process.env.FFMPEG_BIN || 'ffmpeg';
+const FFPROBE_BIN = process.env.FFPROBE_BIN || 'ffprobe';
 
-app.use(express.json({ limit: '50mb' }));
+async function ensureDir(dir) {
+  await fsp.mkdir(dir, { recursive: true });
+}
 
-// ============================================================
-// HEALTH CHECK
-// ============================================================
-app.get('/health', (req, res) => {
-  let ffmpegOk = false;
-  try { execSync('ffmpeg -version', { stdio: 'pipe' }); ffmpegOk = true; } catch (e) {}
-  res.json({ status: 'ok', ffmpeg: ffmpegOk, version: '3.0.0' });
-});
+function renderId() {
+  return crypto.randomBytes(10).toString('hex');
+}
 
-// ============================================================
-// HELPERS
-// ============================================================
-function downloadFile(url, destPath) {
-  return new Promise((resolve, reject) => {
-    const proto = url.startsWith('https') ? https : http;
-    const request = proto.get(url, { timeout: 120000 }, (response) => {
-      if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-        return downloadFile(response.headers.location, destPath).then(resolve).catch(reject);
-      }
-      if (response.statusCode !== 200) {
-        return reject(new Error(`HTTP ${response.statusCode} downloading ${url.slice(0, 80)}`));
-      }
-      const file = fs.createWriteStream(destPath);
-      response.pipe(file);
-      file.on('finish', () => { file.close(); resolve(destPath); });
-      file.on('error', (err) => { fs.unlink(destPath, () => {}); reject(err); });
-    });
-    request.on('error', reject);
-    request.on('timeout', () => { request.destroy(); reject(new Error('Download timeout')); });
+function safeName(name, fallback = 'track') {
+  return String(name || fallback)
+    .replace(/[^a-zA-Z0-9-_]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .slice(0, 60) || fallback;
+}
+
+function validatePayload(body) {
+  if (!body || !Array.isArray(body.tracks) || body.tracks.length === 0) {
+    throw new Error('Request must include a non-empty tracks[] array');
+  }
+  for (const [i, track] of body.tracks.entries()) {
+    if (!track.url) throw new Error(`tracks[${i}].url is required`);
+    if (!track.imagePrompt) throw new Error(`tracks[${i}].imagePrompt is required`);
+    if (!track.durationSeconds || Number(track.durationSeconds) <= 0) {
+      throw new Error(`tracks[${i}].durationSeconds must be > 0`);
+    }
+  }
+}
+
+async function downloadFile(url, outPath) {
+  const response = await axios({
+    method: 'GET',
+    url,
+    responseType: 'stream',
+    timeout: 120000,
+    maxRedirects: 5,
+  });
+
+  await new Promise((resolve, reject) => {
+    const writer = fs.createWriteStream(outPath);
+    response.data.pipe(writer);
+    writer.on('finish', resolve);
+    writer.on('error', reject);
   });
 }
 
-function saveBase64ToFile(b64, destPath) {
-  let raw = b64;
-  if (raw.startsWith('data:')) raw = raw.split(',')[1] || raw;
-  fs.writeFileSync(destPath, Buffer.from(raw, 'base64'));
-  return destPath;
-}
-
-async function generateImage(prompt, destPath, apiKey, size = '1536x1024', quality = 'low') {
-  const body = JSON.stringify({
-    model: 'gpt-image-1',
+async function generateImage({ client, prompt, size, quality, outPath }) {
+  const result = await client.images.generate({
+    model: OPENAI_IMAGE_MODEL,
     prompt,
-    n: 1,
     size,
     quality,
-    output_format: 'png'
+    output_format: 'png',
   });
 
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: 'api.openai.com',
-      path: '/v1/images/generations',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Length': Buffer.byteLength(body)
-      },
-      timeout: 120000
-    }, (res) => {
-      let data = '';
-      res.on('data', chunk => { data += chunk; });
-      res.on('end', () => {
-        try {
-          const parsed = JSON.parse(data);
-          if (parsed.error) return reject(new Error(parsed.error.message));
-          const b64 = parsed.data?.[0]?.b64_json;
-          if (!b64) return reject(new Error('No b64_json in OpenAI response'));
-          saveBase64ToFile(b64, destPath);
-          resolve(destPath);
-        } catch (e) { reject(new Error('Failed to parse OpenAI response: ' + e.message)); }
-      });
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('OpenAI request timeout')); });
-    req.write(body);
-    req.end();
-  });
+  const image = result?.data?.[0];
+  if (!image?.b64_json) {
+    throw new Error('OpenAI image response did not include b64_json');
+  }
+
+  const buffer = Buffer.from(image.b64_json, 'base64');
+  await fsp.writeFile(outPath, buffer);
 }
 
-// ============================================================
-// MAIN RENDER ENDPOINT (v3 — generates images server-side)
-// ============================================================
+async function probeDurationSeconds(filePath) {
+  const { stdout } = await execFileAsync(FFPROBE_BIN, [
+    '-v', 'error',
+    '-show_entries', 'format=duration',
+    '-of', 'default=noprint_wrappers=1:nokey=1',
+    filePath,
+  ]);
+  const n = Number(String(stdout).trim());
+  return Number.isFinite(n) ? n : 0;
+}
+
+async function runFfmpeg(args) {
+  try {
+    await execFileAsync(FFMPEG_BIN, args, { maxBuffer: 1024 * 1024 * 20 });
+  } catch (err) {
+    const stderr = err?.stderr || err?.message || 'Unknown ffmpeg error';
+    throw new Error(stderr);
+  }
+}
+
+function buildImageVideoFilter(resolution) {
+  const [width, height] = String(resolution || '1920x1080').split('x').map(Number);
+  return [
+    `scale=${width}:${height}:force_original_aspect_ratio=increase`,
+    `crop=${width}:${height}`,
+    'format=yuv420p',
+  ].join(',');
+}
+
+async function createSegmentVideo({ imagePath, audioPath, durationSeconds, resolution, fps, outPath }) {
+  const vf = buildImageVideoFilter(resolution);
+  await runFfmpeg([
+    '-y',
+    '-loop', '1',
+    '-framerate', String(fps || 24),
+    '-i', imagePath,
+    '-i', audioPath,
+    '-t', String(durationSeconds),
+    '-vf', vf,
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac',
+    '-b:a', '192k',
+    '-ar', '48000',
+    '-shortest',
+    outPath,
+  ]);
+}
+
+async function concatSegmentsHardCut(segmentPaths, outPath) {
+  const listPath = path.join(path.dirname(outPath), 'segments.txt');
+  const text = segmentPaths.map(p => `file '${p.replace(/'/g, `'\\''`)}'`).join('\n');
+  await fsp.writeFile(listPath, text);
+  await runFfmpeg([
+    '-y',
+    '-f', 'concat',
+    '-safe', '0',
+    '-i', listPath,
+    '-c', 'copy',
+    outPath,
+  ]);
+}
+
+function buildCrossfadeFilter(segmentDurations, crossfadeSec) {
+  if (segmentDurations.length < 2) return { filter: '', vLabel: '0:v', aLabel: '0:a' };
+
+  const parts = [];
+  let currentV = '0:v';
+  let currentA = '0:a';
+  let priorCombined = segmentDurations[0];
+
+  for (let i = 1; i < segmentDurations.length; i += 1) {
+    const vOut = `v${i}`;
+    const aOut = `a${i}`;
+    const offset = Math.max(0, priorCombined - crossfadeSec);
+
+    parts.push(`[${currentV}][${i}:v]xfade=transition=fade:duration=${crossfadeSec}:offset=${offset}[${vOut}]`);
+    parts.push(`[${currentA}][${i}:a]acrossfade=d=${crossfadeSec}[${aOut}]`);
+
+    currentV = vOut;
+    currentA = aOut;
+    priorCombined = priorCombined + segmentDurations[i] - crossfadeSec;
+  }
+
+  return { filter: parts.join(';'), vLabel: currentV, aLabel: currentA };
+}
+
+async function concatSegmentsCrossfade(segmentPaths, segmentDurations, crossfadeSec, outPath) {
+  const inputs = [];
+  for (const p of segmentPaths) inputs.push('-i', p);
+
+  const { filter, vLabel, aLabel } = buildCrossfadeFilter(segmentDurations, crossfadeSec);
+  await runFfmpeg([
+    '-y',
+    ...inputs,
+    '-filter_complex', filter,
+    '-map', `[${vLabel}]`,
+    '-map', `[${aLabel}]`,
+    '-c:v', 'libx264',
+    '-preset', 'veryfast',
+    '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac',
+    '-b:a', '192k',
+    outPath,
+  ]);
+}
+
+async function buildPublicUrl(filePath) {
+  const fileName = path.basename(filePath);
+  if (BASE_URL) return `${BASE_URL.replace(/\/$/, '')}/download/${fileName}`;
+  return `/download/${fileName}`;
+}
+
+app.get('/health', async (_req, res) => {
+  res.json({ ok: true, imageModel: OPENAI_IMAGE_MODEL });
+});
+
+app.get('/download/:fileName', async (req, res) => {
+  const fileName = path.basename(req.params.fileName);
+  const filePath = path.join(DOWNLOAD_DIR, fileName);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: 'File not found' });
+  }
+  return res.download(filePath);
+});
+
 app.post('/render', async (req, res) => {
-  const jobId = crypto.randomBytes(8).toString('hex');
-  const workDir = path.join('/tmp', `job-${jobId}`);
+  const startedAt = Date.now();
+  const id = renderId();
+  const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), `render-${id}-`));
 
   try {
-    fs.mkdirSync(workDir, { recursive: true });
+    validatePayload(req.body);
 
-    const { tracks, imagePrompts, openaiApiKey, crossfadeSec = 2, output = {} } = req.body;
-
-    if (!tracks || !Array.isArray(tracks) || tracks.length === 0) {
-      return res.status(400).json({ error: 'No tracks provided' });
-    }
-
-    const resolution = output.resolution || '1920x1080';
-    const [width, height] = resolution.split('x').map(Number);
-    const fps = output.fps || 24;
-    const imageSize = output.imageSize || '1024x1024';
+    const { tracks, output = {}, crossfadeSec = 0, openaiApiKey } = req.body;
+    const imageSize = output.imageSize || '1536x1024';
     const imageQuality = output.imageQuality || 'low';
+    const resolution = output.resolution || '1920x1080';
+    const fps = Number(output.fps || 24);
 
-    console.log(`[${jobId}] Starting render: ${tracks.length} tracks`);
-
-    // ── Step 1: Download audio tracks ──
-    console.log(`[${jobId}] Downloading ${tracks.length} audio tracks...`);
-    const trackPaths = [];
-    for (let i = 0; i < tracks.length; i++) {
-      const audioPath = path.join(workDir, `track_${String(i).padStart(3, '0')}.mp3`);
-      await downloadFile(tracks[i].url, audioPath);
-      trackPaths.push({ path: audioPath, durationSeconds: tracks[i].durationSeconds || 240 });
-      console.log(`[${jobId}]   Track ${i + 1}/${tracks.length} downloaded`);
+    if (!openaiApiKey) {
+      throw new Error('openaiApiKey is required');
     }
 
-    // ── Step 2: Generate or download images ──
-    const imagePaths = [];
-    const prompts = imagePrompts || [];
+    await ensureDir(DOWNLOAD_DIR);
+    const client = new OpenAI({ apiKey: openaiApiKey });
 
-    for (let i = 0; i < tracks.length; i++) {
-      const imgPath = path.join(workDir, `img_${String(i).padStart(3, '0')}.png`);
+    const segmentPaths = [];
+    const segmentDurations = [];
+    const generatedImages = [];
 
-      if (tracks[i].imageUrl && tracks[i].imageUrl.startsWith('http')) {
-        // Pre-generated image URL
-        console.log(`[${jobId}]   Image ${i + 1}: downloading from URL...`);
-        await downloadFile(tracks[i].imageUrl, imgPath);
-      } else if (tracks[i].imageB64) {
-        // Pre-generated base64
-        console.log(`[${jobId}]   Image ${i + 1}: decoding base64...`);
-        saveBase64ToFile(tracks[i].imageB64, imgPath);
-      } else if (prompts[i] && openaiApiKey) {
-        // Generate on the server
-        console.log(`[${jobId}]   Image ${i + 1}: generating via OpenAI...`);
-        await generateImage(prompts[i], imgPath, openaiApiKey, imageSize, imageQuality);
-        console.log(`[${jobId}]   Image ${i + 1}: generated!`);
-      } else {
-        // Fallback: solid color placeholder
-        console.log(`[${jobId}]   Image ${i + 1}: generating placeholder...`);
-        const colors = ['#2d1b0e', '#1a2e1a', '#0e1b2d', '#2d0e1b', '#1b2d0e'];
-        const color = colors[i % colors.length];
-        execSync(`ffmpeg -y -f lavfi -i "color=c=${color}:s=${width}x${height}:d=1" -frames:v 1 "${imgPath}"`,
-          { stdio: 'pipe', timeout: 10000 });
+    for (const [index, track] of tracks.entries()) {
+      const trackName = safeName(track.trackName, `track_${index + 1}`);
+      const audioPath = path.join(tempDir, `${String(index + 1).padStart(2, '0')}_${trackName}.audio`);
+      const imagePath = path.join(tempDir, `${String(index + 1).padStart(2, '0')}_${trackName}.png`);
+      const segmentPath = path.join(tempDir, `${String(index + 1).padStart(2, '0')}_${trackName}.mp4`);
+
+      console.log(`[render:${id}] downloading audio for track ${index + 1}`);
+      await downloadFile(track.url, audioPath);
+
+      console.log(`[render:${id}] generating image for track ${index + 1}`);
+      await generateImage({
+        client,
+        prompt: track.imagePrompt,
+        size: imageSize,
+        quality: imageQuality,
+        outPath: imagePath,
+      });
+
+      const requestedDuration = Number(track.durationSeconds || 0);
+      const probedAudioDuration = await probeDurationSeconds(audioPath);
+      const durationSeconds = requestedDuration > 0 ? requestedDuration : probedAudioDuration;
+      if (durationSeconds <= 0) {
+        throw new Error(`Could not determine duration for track ${index + 1}`);
       }
-      imagePaths.push({ path: imgPath, durationSeconds: trackPaths[i]?.durationSeconds || 240 });
+
+      console.log(`[render:${id}] building segment video for track ${index + 1}`);
+      await createSegmentVideo({
+        imagePath,
+        audioPath,
+        durationSeconds,
+        resolution,
+        fps,
+        outPath: segmentPath,
+      });
+
+      segmentPaths.push(segmentPath);
+      segmentDurations.push(durationSeconds);
+      generatedImages.push({
+        trackNumber: track.trackNumber || index + 1,
+        trackName: track.trackName || '',
+        prompt: track.imagePrompt,
+        localImageFile: path.basename(imagePath),
+        durationSeconds,
+      });
     }
 
-    // ── Step 2b: Convert PNGs to pre-scaled JPEGs (saves memory during encoding) ──
-    console.log(`[${jobId}] Pre-scaling images to ${width}x${height}...`);
-    for (let i = 0; i < imagePaths.length; i++) {
-      const jpgPath = imagePaths[i].path.replace('.png', '_scaled.jpg');
-      execSync(
-        `ffmpeg -y -i "${imagePaths[i].path}" -vf "scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2:black" -q:v 2 "${jpgPath}"`,
-        { stdio: 'pipe', timeout: 30000 }
-      );
-      imagePaths[i].path = jpgPath;
-    }
+    const finalName = `${id}.mp4`;
+    const finalPath = path.join(DOWNLOAD_DIR, finalName);
 
-    // ── Step 3: Concatenate audio ──
-    console.log(`[${jobId}] Concatenating audio...`);
-    let audioOutputPath;
-    if (trackPaths.length === 1) {
-      audioOutputPath = trackPaths[0].path;
+    if (segmentPaths.length === 1 || Number(crossfadeSec) <= 0) {
+      console.log(`[render:${id}] concatenating with hard cuts`);
+      await concatSegmentsHardCut(segmentPaths, finalPath);
     } else {
-      const audioListFile = path.join(workDir, 'audio_list.txt');
-      fs.writeFileSync(audioListFile, trackPaths.map(t => `file '${t.path}'`).join('\n'));
-      audioOutputPath = path.join(workDir, 'combined_audio.mp3');
-      execSync(`ffmpeg -y -f concat -safe 0 -i "${audioListFile}" -c:a libmp3lame -q:a 2 "${audioOutputPath}"`,
-        { stdio: 'pipe', timeout: 300000 });
+      console.log(`[render:${id}] concatenating with crossfades (${crossfadeSec}s)`);
+      await concatSegmentsCrossfade(segmentPaths, segmentDurations, Number(crossfadeSec), finalPath);
     }
 
-    // ── Step 4: Get audio duration ──
-    const probeResult = execSync(
-      `ffprobe -v error -show_entries format=duration -of csv=p=0 "${audioOutputPath}"`,
-      { stdio: 'pipe', timeout: 30000 }
-    ).toString().trim();
-    const audioDuration = parseFloat(probeResult) || 3600;
-    console.log(`[${jobId}] Total audio duration: ${audioDuration}s`);
+    const publicUrl = await buildPublicUrl(finalPath);
+    const durationMs = Date.now() - startedAt;
 
-    // ── Step 5: Build slideshow ──
-    console.log(`[${jobId}] Building slideshow...`);
-    const concatContent = imagePaths.map(img =>
-      `file '${img.path}'\nduration ${img.durationSeconds}`
-    ).join('\n') + `\nfile '${imagePaths[imagePaths.length - 1].path}'`;
-    const concatFile = path.join(workDir, 'images.txt');
-    fs.writeFileSync(concatFile, concatContent);
-
-    // ── Step 6: Assemble final video ──
-    console.log(`[${jobId}] Assembling final video...`);
-    const outputPath = path.join(workDir, `output_${jobId}.mp4`);
-    execSync(
-      `ffmpeg -y -f concat -safe 0 -i "${concatFile}" ` +
-      `-i "${audioOutputPath}" ` +
-      `-vf "fps=${fps}" ` +
-      `-c:v libx264 -preset ultrafast -crf 28 -pix_fmt yuv420p -threads 2 ` +
-      `-c:a aac -b:a 128k ` +
-      `-t ${audioDuration} ` +
-      `-shortest ` +
-      `-movflags +faststart ` +
-      `"${outputPath}"`,
-      { stdio: 'pipe', timeout: 900000, maxBuffer: 50 * 1024 * 1024 }
-    );
-
-    const stats = fs.statSync(outputPath);
-    const fileSizeMB = (stats.size / (1024 * 1024)).toFixed(1);
-    console.log(`[${jobId}] Done! ${fileSizeMB}MB`);
-
-    // Serve video via download endpoint
-    const videoUrl = `https://${req.headers.host}/download/${jobId}`;
-    app.locals[`job_${jobId}`] = outputPath;
-
-    // Clean up after 30 min
-    setTimeout(() => {
-      try { fs.rmSync(workDir, { recursive: true, force: true }); delete app.locals[`job_${jobId}`]; } catch (e) {}
-    }, 30 * 60 * 1000);
-
-    res.json({
+    return res.json({
       status: 'complete',
-      url: videoUrl,
-      videoUrl: videoUrl,
-      jobId,
-      duration: audioDuration,
-      fileSizeMB: parseFloat(fileSizeMB),
+      renderId: id,
+      url: publicUrl,
       trackCount: tracks.length,
-      imageCount: imagePaths.length
+      generatedImages,
+      elapsedMs: durationMs,
     });
-
-  } catch (err) {
-    console.error(`[${jobId}] Error:`, err.message);
-    try { fs.rmSync(workDir, { recursive: true, force: true }); } catch (e) {}
-    res.status(500).json({ error: err.message, jobId });
+  } catch (error) {
+    console.error(`[render:${id}]`, error);
+    return res.status(500).json({
+      status: 'error',
+      renderId: id,
+      error: error?.message || 'Unknown render error',
+    });
+  } finally {
+    try {
+      await fsp.rm(tempDir, { recursive: true, force: true });
+    } catch (_) {
+      // ignore temp cleanup failures
+    }
   }
 });
 
-// ============================================================
-// DOWNLOAD ENDPOINT
-// ============================================================
-app.get('/download/:jobId', (req, res) => {
-  const outputPath = app.locals[`job_${req.params.jobId}`];
-  if (!outputPath || !fs.existsSync(outputPath)) {
-    return res.status(404).json({ error: 'Video not found or expired' });
-  }
-  res.setHeader('Content-Type', 'video/mp4');
-  res.setHeader('Content-Disposition', `attachment; filename="ambient_${req.params.jobId}.mp4"`);
-  fs.createReadStream(outputPath).pipe(res);
-});
-
-app.listen(PORT, () => {
-  console.log(`FFmpeg Video Assembly v3.0 running on port ${PORT}`);
+app.listen(PORT, async () => {
+  await ensureDir(DOWNLOAD_DIR);
+  console.log(`FFmpeg render service listening on ${PORT}`);
 });
