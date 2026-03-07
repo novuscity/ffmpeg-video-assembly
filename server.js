@@ -112,12 +112,24 @@ async function probeDurationSeconds(filePath) {
 }
 
 async function runFfmpeg(args) {
-  try {
-    await execFileAsync(FFMPEG_BIN, args, { maxBuffer: 1024 * 1024 * 20 });
-  } catch (err) {
-    const stderr = err?.stderr || err?.message || 'Unknown ffmpeg error';
-    throw new Error(stderr);
-  }
+  const { spawn } = require('child_process');
+  return new Promise((resolve, reject) => {
+    const proc = spawn(FFMPEG_BIN, args);
+    let stderr = '';
+    // Only keep last 4KB of stderr (progress lines are noise, errors are at the end)
+    proc.stderr.on('data', (d) => {
+      stderr += d.toString();
+      if (stderr.length > 4096) stderr = stderr.slice(-4096);
+    });
+    proc.on('error', (err) => reject(err));
+    proc.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`ffmpeg exited with code ${code}\n${stderr}`));
+        return;
+      }
+      resolve();
+    });
+  });
 }
 
 function buildImageVideoFilter(resolution) {
@@ -134,18 +146,19 @@ async function createSegmentVideo({ imagePath, audioPath, durationSeconds, resol
   await runFfmpeg([
     '-y',
     '-loop', '1',
-    '-framerate', String(fps || 24),
+    '-framerate', String(fps || 1),
     '-i', imagePath,
+    '-stream_loop', '-1',
     '-i', audioPath,
     '-t', String(durationSeconds),
     '-vf', vf,
     '-c:v', 'libx264',
-    '-preset', 'veryfast',
+    '-preset', 'ultrafast',
+    '-tune', 'stillimage',
     '-pix_fmt', 'yuv420p',
     '-c:a', 'aac',
     '-b:a', '192k',
     '-ar', '48000',
-    '-shortest',
     outPath,
   ]);
 }
@@ -275,6 +288,10 @@ app.post('/render', async (req, res) => {
       const durationSeconds = requestedDuration > 0 ? requestedDuration : probedAudioDuration;
       if (durationSeconds <= 0) {
         throw new Error(`Could not determine duration for track ${index + 1}`);
+      }
+
+      if (probedAudioDuration > 0 && requestedDuration > 0 && probedAudioDuration < requestedDuration * 0.9) {
+        console.log(`[render:${id}] track ${index + 1}: audio is ${probedAudioDuration.toFixed(0)}s but segment target is ${requestedDuration}s — audio will loop`);
       }
 
       console.log(`[render:${id}] building segment video for track ${index + 1}`);
