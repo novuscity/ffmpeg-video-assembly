@@ -223,7 +223,15 @@ async function concatSegmentsCrossfade(segmentPaths, segmentDurations, crossfade
 
 async function buildPublicUrl(filePath) {
   const fileName = path.basename(filePath);
-  if (BASE_URL) return `${BASE_URL.replace(/\/$/, '')}/download/${fileName}`;
+  if (BASE_URL) {
+    const base = BASE_URL.replace(/\/$/, '');
+    const url = `${base}/download/${fileName}`;
+    // Ensure protocol is present
+    return url.startsWith('http') ? url : `https://${url}`;
+  }
+  // Fallback: construct from RAILWAY_PUBLIC_DOMAIN if available
+  const domain = process.env.RAILWAY_PUBLIC_DOMAIN || '';
+  if (domain) return `https://${domain}/download/${fileName}`;
   return `/download/${fileName}`;
 }
 
