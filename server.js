@@ -229,7 +229,6 @@ async function createSegmentVideo({ imagePath, audioPath, durationSeconds, resol
   args.push(outPath);
   await runFfmpeg(args);
 }
-}
 
 async function concatSegmentsHardCut(segmentPaths, outPath) {
   const listPath = path.join(path.dirname(outPath), 'segments.txt');
