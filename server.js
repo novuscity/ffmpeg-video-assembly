@@ -317,7 +317,7 @@ async function processRenderJob(id, body) {
 
     for (const [index, track] of tracks.entries()) {
       const trackName = safeName(track.trackName, `track_${index + 1}`);
-      const audioPath = path.join(tempDir, `${String(index + 1).padStart(2, '0')}_${trackName}.audio`);
+      const audioPath = path.join(tempDir, `${String(index + 1).padStart(2, '0')}_${trackName}.mp3`);
       const imagePath = path.join(tempDir, `${String(index + 1).padStart(2, '0')}_${trackName}.png`);
       const segmentPath = path.join(tempDir, `${String(index + 1).padStart(2, '0')}_${trackName}.mp4`);
 
@@ -334,7 +334,7 @@ async function processRenderJob(id, body) {
       
       const downloadedAudioPaths = [];
       for (const [ai, aUrl] of audioUrls.entries()) {
-        const partPath = path.join(tempDir, `${String(index + 1).padStart(2, '0')}_${trackName}_part${ai + 1}.audio`);
+        const partPath = path.join(tempDir, `${String(index + 1).padStart(2, '0')}_${trackName}_part${ai + 1}.mp3`);
         console.log(`[render:${id}] downloading audio ${ai + 1}/${audioUrls.length} for track ${index + 1}`);
         await downloadFile(aUrl, partPath);
         downloadedAudioPaths.push(partPath);
