@@ -81,11 +81,12 @@ function validatePayload(body) {
     throw new Error('Request must include a non-empty tracks[] array');
   }
   for (const [i, track] of body.tracks.entries()) {
-    if (!track.url) throw new Error(`tracks[${i}].url is required`);
+    // Accept either urls[] array or single url
+    const hasUrls = Array.isArray(track.urls) && track.urls.length > 0;
+    const hasUrl = track.url && typeof track.url === 'string';
+    if (!hasUrls && !hasUrl) throw new Error(`tracks[${i}] needs url or urls[]`);
     if (!track.imagePrompt) throw new Error(`tracks[${i}].imagePrompt is required`);
-    if (!track.durationSeconds || Number(track.durationSeconds) <= 0) {
-      throw new Error(`tracks[${i}].durationSeconds must be > 0`);
-    }
+    // durationSeconds is now optional — 0 means "use actual audio length"
   }
 }
 
@@ -103,6 +104,27 @@ async function downloadFile(url, outPath) {
     writer.on('finish', resolve);
     writer.on('error', reject);
   });
+}
+
+async function concatAudioFiles(audioPaths, outPath) {
+  if (audioPaths.length === 1) {
+    // Just copy the single file
+    await fsp.copyFile(audioPaths[0], outPath);
+    return;
+  }
+  // Build ffmpeg concat list
+  const listPath = outPath + '.list.txt';
+  const text = audioPaths.map(p => `file '${p.replace(/'/g, `'\\''`)}'`).join('\n');
+  await fsp.writeFile(listPath, text);
+  await runFfmpeg([
+    '-y',
+    '-f', 'concat',
+    '-safe', '0',
+    '-i', listPath,
+    '-c', 'copy',
+    outPath,
+  ]);
+  try { await fsp.unlink(listPath); } catch(_) {}
 }
 
 async function generateImage({ client, prompt, size, quality, outPath }) {
@@ -188,7 +210,6 @@ async function createSegmentVideo({ imagePath, audioPath, durationSeconds, resol
     '-loop', '1',
     '-framerate', String(fps || 1),
     '-i', imagePath,
-    '-stream_loop', '-1',
     '-i', audioPath,
     '-t', String(durationSeconds),
     '-vf', videoFilters.join(','),
@@ -307,8 +328,26 @@ async function processRenderJob(id, body) {
         trackCount: tracks.length,
       });
 
-      console.log(`[render:${id}] downloading audio for track ${index + 1}`);
-      await downloadFile(track.url, audioPath);
+      // Download all audio variations for this track
+      const audioUrls = Array.isArray(track.urls) && track.urls.length > 0
+        ? track.urls
+        : [track.url];
+      
+      const downloadedAudioPaths = [];
+      for (const [ai, aUrl] of audioUrls.entries()) {
+        const partPath = path.join(tempDir, `${String(index + 1).padStart(2, '0')}_${trackName}_part${ai + 1}.audio`);
+        console.log(`[render:${id}] downloading audio ${ai + 1}/${audioUrls.length} for track ${index + 1}`);
+        await downloadFile(aUrl, partPath);
+        downloadedAudioPaths.push(partPath);
+      }
+
+      // Concatenate all audio parts into one file
+      if (downloadedAudioPaths.length > 1) {
+        console.log(`[render:${id}] concatenating ${downloadedAudioPaths.length} audio parts for track ${index + 1}`);
+        await concatAudioFiles(downloadedAudioPaths, audioPath);
+      } else {
+        await fsp.copyFile(downloadedAudioPaths[0], audioPath);
+      }
 
       setJob(id, {
         status: 'rendering',
@@ -327,14 +366,13 @@ async function processRenderJob(id, body) {
 
       const requestedDuration = Number(track.durationSeconds || 0);
       const probedAudioDuration = await probeDurationSeconds(audioPath);
-      const durationSeconds = requestedDuration > 0 ? requestedDuration : probedAudioDuration;
+      // Use actual audio duration (sum of all variations) — no more looping
+      const durationSeconds = probedAudioDuration > 0 ? probedAudioDuration : requestedDuration;
       if (durationSeconds <= 0) {
         throw new Error(`Could not determine duration for track ${index + 1}`);
       }
 
-      if (probedAudioDuration > 0 && requestedDuration > 0 && probedAudioDuration < requestedDuration * 0.9) {
-        console.log(`[render:${id}] track ${index + 1}: audio is ${probedAudioDuration.toFixed(0)}s but target is ${requestedDuration}s — audio will loop`);
-      }
+      console.log(`[render:${id}] track ${index + 1}: ${audioUrls.length} variations, total audio ${probedAudioDuration.toFixed(0)}s`);
 
       setJob(id, {
         status: 'rendering',
