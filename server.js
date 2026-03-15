@@ -160,9 +160,30 @@ function buildImageVideoFilter(resolution) {
   ].join(',');
 }
 
-async function createSegmentVideo({ imagePath, audioPath, durationSeconds, resolution, fps, outPath }) {
+async function createSegmentVideo({ imagePath, audioPath, durationSeconds, resolution, fps, outPath, fadeInSec = 0, fadeOutSec = 0 }) {
   const vf = buildImageVideoFilter(resolution);
-  await runFfmpeg([
+  
+  // Build audio filter for fades
+  const audioFilters = [];
+  if (fadeInSec > 0) {
+    audioFilters.push(`afade=t=in:d=${fadeInSec}`);
+  }
+  if (fadeOutSec > 0) {
+    const fadeStart = Math.max(0, durationSeconds - fadeOutSec);
+    audioFilters.push(`afade=t=out:st=${fadeStart}:d=${fadeOutSec}`);
+  }
+
+  // Build video filter for fades (fade to/from black)
+  const videoFilters = [vf];
+  if (fadeInSec > 0) {
+    videoFilters.push(`fade=t=in:d=${fadeInSec}`);
+  }
+  if (fadeOutSec > 0) {
+    const fadeStart = Math.max(0, durationSeconds - fadeOutSec);
+    videoFilters.push(`fade=t=out:st=${fadeStart}:d=${fadeOutSec}`);
+  }
+
+  const args = [
     '-y',
     '-loop', '1',
     '-framerate', String(fps || 1),
@@ -170,7 +191,7 @@ async function createSegmentVideo({ imagePath, audioPath, durationSeconds, resol
     '-stream_loop', '-1',
     '-i', audioPath,
     '-t', String(durationSeconds),
-    '-vf', vf,
+    '-vf', videoFilters.join(','),
     '-c:v', 'libx264',
     '-preset', 'ultrafast',
     '-tune', 'stillimage',
@@ -178,8 +199,15 @@ async function createSegmentVideo({ imagePath, audioPath, durationSeconds, resol
     '-c:a', 'aac',
     '-b:a', '192k',
     '-ar', '48000',
-    outPath,
-  ]);
+  ];
+
+  if (audioFilters.length > 0) {
+    args.push('-af', audioFilters.join(','));
+  }
+
+  args.push(outPath);
+  await runFfmpeg(args);
+}
 }
 
 async function concatSegmentsHardCut(segmentPaths, outPath) {
@@ -315,6 +343,13 @@ async function processRenderJob(id, body) {
       });
 
       console.log(`[render:${id}] building segment video for track ${index + 1}`);
+      
+      // Fade logic: 3s fade-in on first track, 3s fade-out on last track
+      // Middle tracks get both fade-in and fade-out for smooth transitions
+      const isFirst = index === 0;
+      const isLast = index === tracks.length - 1;
+      const FADE_SEC = 3;
+      
       await createSegmentVideo({
         imagePath,
         audioPath,
@@ -322,6 +357,8 @@ async function processRenderJob(id, body) {
         resolution,
         fps,
         outPath: segmentPath,
+        fadeInSec: isFirst ? 0 : FADE_SEC,
+        fadeOutSec: isLast ? FADE_SEC + 2 : FADE_SEC,
       });
 
       segmentPaths.push(segmentPath);
