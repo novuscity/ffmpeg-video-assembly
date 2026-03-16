@@ -128,16 +128,50 @@ async function concatAudioFiles(audioPaths, outPath) {
 }
 
 async function generateImage({ client, prompt, size, quality, outPath }) {
+  // Try the full prompt first
+  try {
+    const result = await client.images.generate({
+      model: OPENAI_IMAGE_MODEL,
+      prompt,
+      size,
+      quality,
+      output_format: 'png',
+    });
+    const image = result?.data?.[0];
+    if (!image?.b64_json) {
+      throw new Error('OpenAI image response did not include b64_json');
+    }
+    const buffer = Buffer.from(image.b64_json, 'base64');
+    await fsp.writeFile(outPath, buffer);
+    return;
+  } catch (err) {
+    const msg = String(err?.message || '');
+    if (!msg.includes('safety') && !msg.includes('rejected')) {
+      throw err; // Not a safety issue, rethrow
+    }
+    console.log(`[image] Safety rejection on full prompt, retrying with simplified version...`);
+  }
+
+  // Retry with a much shorter, simpler prompt
+  const simplified = prompt
+    .split('.')[0]  // Take just the first sentence
+    .replace(/no text.*$/i, '')  // Remove negative instructions
+    .replace(/not photorealistic.*$/i, '')
+    .trim()
+    + '. Warm editorial illustration, cozy ambient lighting, soft colors.';
+  
+  console.log(`[image] Simplified prompt: ${simplified.slice(0, 100)}...`);
+  
   const result = await client.images.generate({
     model: OPENAI_IMAGE_MODEL,
-    prompt,
+    prompt: simplified,
     size,
     quality,
     output_format: 'png',
   });
   const image = result?.data?.[0];
   if (!image?.b64_json) {
-    throw new Error('OpenAI image response did not include b64_json');
+    throw new Error('OpenAI image response did not include b64_json (even with simplified prompt)');
   }
   const buffer = Buffer.from(image.b64_json, 'base64');
   await fsp.writeFile(outPath, buffer);
