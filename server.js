@@ -143,35 +143,47 @@ async function generateImage({ geminiApiKey, openaiApiKey, prompt, size, quality
 async function generateImageGemini({ apiKey, prompt, outPath }) {
   const url = `${GEMINI_API_URL}/${GEMINI_IMAGE_MODEL}:generateContent`;
   
-  async function callGemini(promptText) {
-    const response = await axios({
-      method: 'POST',
-      url,
-      headers: {
-        'Content-Type': 'application/json',
-        'x-goog-api-key': apiKey,
-      },
-      data: {
-        contents: [{ parts: [{ text: promptText }] }],
-        generationConfig: {
-          responseModalities: ['IMAGE', 'TEXT'],
-          imageConfig: { aspectRatio: '16:9' },
+  async function callGemini(promptText, attempt = 1) {
+    try {
+      const response = await axios({
+        method: 'POST',
+        url,
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': apiKey,
         },
-      },
-      timeout: 60000,
-    });
-    
-    // Find image part in response
-    const candidates = response.data?.candidates || [];
-    for (const candidate of candidates) {
-      const parts = candidate?.content?.parts || [];
-      for (const part of parts) {
-        if (part?.inlineData?.data) {
-          return Buffer.from(part.inlineData.data, 'base64');
+        data: {
+          contents: [{ parts: [{ text: promptText }] }],
+          generationConfig: {
+            responseModalities: ['IMAGE', 'TEXT'],
+            imageConfig: { aspectRatio: '16:9' },
+          },
+        },
+        timeout: 60000,
+      });
+      
+      // Find image part in response
+      const candidates = response.data?.candidates || [];
+      for (const candidate of candidates) {
+        const parts = candidate?.content?.parts || [];
+        for (const part of parts) {
+          if (part?.inlineData?.data) {
+            return Buffer.from(part.inlineData.data, 'base64');
+          }
         }
       }
+      return null;
+    } catch (err) {
+      const status = err?.response?.status || 0;
+      // Retry on 429 (rate limit) and 503 (overloaded) with exponential backoff
+      if ((status === 429 || status === 503) && attempt <= 5) {
+        const waitSec = Math.min(15 * attempt, 60);
+        console.log(`[image] Gemini ${status} rate limit, waiting ${waitSec}s (attempt ${attempt}/5)...`);
+        await new Promise(r => setTimeout(r, waitSec * 1000));
+        return callGemini(promptText, attempt + 1);
+      }
+      throw err;
     }
-    return null;
   }
 
   // Try full prompt
@@ -449,6 +461,11 @@ async function processRenderJob(id, body) {
       });
 
       console.log(`[render:${id}] generating image for track ${index + 1}`);
+      // Space out Gemini API calls to avoid 429 rate limits (free tier: ~10/min)
+      if (index > 0 && geminiApiKey) {
+        console.log(`[render:${id}] waiting 15s before next image (rate limit spacing)...`);
+        await new Promise(r => setTimeout(r, 15000));
+      }
       await generateImage({
         geminiApiKey,
         openaiApiKey,
