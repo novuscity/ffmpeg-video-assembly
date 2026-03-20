@@ -27,7 +27,6 @@ const crypto = require('crypto');
 const axios = require('axios');
 const { execFile, spawn } = require('child_process');
 const util = require('util');
-const OpenAI = require('openai');
 
 const execFileAsync = util.promisify(execFile);
 const app = express();
@@ -127,8 +126,83 @@ async function concatAudioFiles(audioPaths, outPath) {
   try { await fsp.unlink(listPath); } catch(_) {}
 }
 
-async function generateImage({ client, prompt, size, quality, outPath }) {
-  // Try the full prompt first
+const GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-image-preview';
+const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
+
+async function generateImage({ geminiApiKey, openaiApiKey, prompt, size, quality, outPath }) {
+  // Prefer NanoBanana 2 (Gemini) if key provided, fallback to OpenAI
+  if (geminiApiKey) {
+    return generateImageGemini({ apiKey: geminiApiKey, prompt, outPath });
+  }
+  if (openaiApiKey) {
+    return generateImageOpenAI({ apiKey: openaiApiKey, prompt, size, quality, outPath });
+  }
+  throw new Error('No image API key provided (need geminiApiKey or openaiApiKey)');
+}
+
+async function generateImageGemini({ apiKey, prompt, outPath }) {
+  const url = `${GEMINI_API_URL}/${GEMINI_IMAGE_MODEL}:generateContent`;
+  
+  async function callGemini(promptText) {
+    const response = await axios({
+      method: 'POST',
+      url,
+      headers: {
+        'Content-Type': 'application/json',
+        'x-goog-api-key': apiKey,
+      },
+      data: {
+        contents: [{ parts: [{ text: promptText }] }],
+        generationConfig: {
+          responseModalities: ['IMAGE', 'TEXT'],
+          imageConfig: { aspectRatio: '16:9' },
+        },
+      },
+      timeout: 60000,
+    });
+    
+    // Find image part in response
+    const candidates = response.data?.candidates || [];
+    for (const candidate of candidates) {
+      const parts = candidate?.content?.parts || [];
+      for (const part of parts) {
+        if (part?.inlineData?.data) {
+          return Buffer.from(part.inlineData.data, 'base64');
+        }
+      }
+    }
+    return null;
+  }
+
+  // Try full prompt
+  try {
+    const buffer = await callGemini(prompt);
+    if (buffer) {
+      await fsp.writeFile(outPath, buffer);
+      console.log(`[image] NanoBanana 2 generated: ${outPath}`);
+      return;
+    }
+    throw new Error('No image data in Gemini response');
+  } catch (err) {
+    const msg = String(err?.message || err?.response?.data?.error?.message || '');
+    if (!msg.includes('safety') && !msg.includes('SAFETY') && !msg.includes('blocked') && !msg.includes('BLOCKED')) {
+      throw err;
+    }
+    console.log(`[image] Gemini safety block, retrying simplified...`);
+  }
+
+  // Retry with simplified prompt
+  const simplified = prompt.split('.')[0].trim() + '. Warm cozy illustration, golden ambient lighting.';
+  console.log(`[image] Simplified: ${simplified.slice(0, 80)}...`);
+  const buffer = await callGemini(simplified);
+  if (!buffer) throw new Error('Gemini failed even with simplified prompt');
+  await fsp.writeFile(outPath, buffer);
+}
+
+async function generateImageOpenAI({ apiKey, prompt, size, quality, outPath }) {
+  const OpenAI = require('openai');
+  const client = new OpenAI({ apiKey });
+  
   try {
     const result = await client.images.generate({
       model: OPENAI_IMAGE_MODEL,
@@ -138,30 +212,16 @@ async function generateImage({ client, prompt, size, quality, outPath }) {
       output_format: 'png',
     });
     const image = result?.data?.[0];
-    if (!image?.b64_json) {
-      throw new Error('OpenAI image response did not include b64_json');
-    }
-    const buffer = Buffer.from(image.b64_json, 'base64');
-    await fsp.writeFile(outPath, buffer);
+    if (!image?.b64_json) throw new Error('OpenAI: no b64_json');
+    await fsp.writeFile(outPath, Buffer.from(image.b64_json, 'base64'));
     return;
   } catch (err) {
     const msg = String(err?.message || '');
-    if (!msg.includes('safety') && !msg.includes('rejected')) {
-      throw err; // Not a safety issue, rethrow
-    }
-    console.log(`[image] Safety rejection on full prompt, retrying with simplified version...`);
+    if (!msg.includes('safety') && !msg.includes('rejected')) throw err;
+    console.log(`[image] OpenAI safety rejection, retrying simplified...`);
   }
 
-  // Retry with a much shorter, simpler prompt
-  const simplified = prompt
-    .split('.')[0]  // Take just the first sentence
-    .replace(/no text.*$/i, '')  // Remove negative instructions
-    .replace(/not photorealistic.*$/i, '')
-    .trim()
-    + '. Warm editorial illustration, cozy ambient lighting, soft colors.';
-  
-  console.log(`[image] Simplified prompt: ${simplified.slice(0, 100)}...`);
-  
+  const simplified = prompt.split('.')[0].trim() + '. Warm editorial illustration, cozy lighting.';
   const result = await client.images.generate({
     model: OPENAI_IMAGE_MODEL,
     prompt: simplified,
@@ -170,11 +230,8 @@ async function generateImage({ client, prompt, size, quality, outPath }) {
     output_format: 'png',
   });
   const image = result?.data?.[0];
-  if (!image?.b64_json) {
-    throw new Error('OpenAI image response did not include b64_json (even with simplified prompt)');
-  }
-  const buffer = Buffer.from(image.b64_json, 'base64');
-  await fsp.writeFile(outPath, buffer);
+  if (!image?.b64_json) throw new Error('OpenAI failed even with simplified prompt');
+  await fsp.writeFile(outPath, Buffer.from(image.b64_json, 'base64'));
 }
 
 async function probeDurationSeconds(filePath) {
@@ -207,17 +264,22 @@ async function runFfmpeg(args) {
   });
 }
 
-function buildImageVideoFilter(resolution) {
+function buildImageVideoFilter(resolution, durationSeconds) {
   const [width, height] = String(resolution || '1920x1080').split('x').map(Number);
+  const totalFrames = Math.ceil((durationSeconds || 120) * 24);
+  
+  // Ken Burns: slow zoom from 1.0x to 1.15x over the full duration
+  // zoompan creates motion from a still image — much more engaging than static
+  // We generate at higher resolution (scale up first) then zoompan crops/zooms within it
   return [
-    `scale=${width}:${height}:force_original_aspect_ratio=increase`,
-    `crop=${width}:${height}`,
+    `scale=${width * 2}:${height * 2}`,
+    `zoompan=z='min(zoom+0.00015,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${width}x${height}:fps=24`,
     'format=yuv420p',
   ].join(',');
 }
 
 async function createSegmentVideo({ imagePath, audioPath, durationSeconds, resolution, fps, outPath, fadeInSec = 0, fadeOutSec = 0 }) {
-  const vf = buildImageVideoFilter(resolution);
+  const vf = buildImageVideoFilter(resolution, durationSeconds);
   
   // Build audio filter for fades
   const audioFilters = [];
@@ -229,7 +291,7 @@ async function createSegmentVideo({ imagePath, audioPath, durationSeconds, resol
     audioFilters.push(`afade=t=out:st=${fadeStart}:d=${fadeOutSec}`);
   }
 
-  // Build video filter for fades (fade to/from black)
+  // Build video filter — Ken Burns zoompan + fades
   const videoFilters = [vf];
   if (fadeInSec > 0) {
     videoFilters.push(`fade=t=in:d=${fadeInSec}`);
@@ -241,8 +303,6 @@ async function createSegmentVideo({ imagePath, audioPath, durationSeconds, resol
 
   const args = [
     '-y',
-    '-loop', '1',
-    '-framerate', String(fps || 1),
     '-i', imagePath,
     '-i', audioPath,
     '-t', String(durationSeconds),
@@ -254,6 +314,7 @@ async function createSegmentVideo({ imagePath, audioPath, durationSeconds, resol
     '-c:a', 'aac',
     '-b:a', '192k',
     '-ar', '48000',
+    '-threads', '2',
   ];
 
   if (audioFilters.length > 0) {
@@ -336,14 +397,13 @@ async function processRenderJob(id, body) {
   const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), `render-${id}-`));
 
   try {
-    const { tracks, output = {}, crossfadeSec = 0, openaiApiKey } = body;
+    const { tracks, output = {}, crossfadeSec = 0, openaiApiKey, geminiApiKey } = body;
     const imageSize = output.imageSize || '1536x1024';
     const imageQuality = output.imageQuality || 'low';
     const resolution = output.resolution || '1920x1080';
     const fps = Number(output.fps || 24);
 
     await ensureDir(DOWNLOAD_DIR);
-    const client = new OpenAI({ apiKey: openaiApiKey });
 
     const segmentPaths = [];
     const segmentDurations = [];
@@ -390,7 +450,8 @@ async function processRenderJob(id, body) {
 
       console.log(`[render:${id}] generating image for track ${index + 1}`);
       await generateImage({
-        client,
+        geminiApiKey,
+        openaiApiKey,
         prompt: track.imagePrompt,
         size: imageSize,
         quality: imageQuality,
@@ -487,7 +548,7 @@ async function processRenderJob(id, body) {
 // ============================================================
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, imageModel: OPENAI_IMAGE_MODEL, version: '4.0.0', async: true });
+  res.json({ ok: true, imageModel: GEMINI_IMAGE_MODEL, fallbackModel: OPENAI_IMAGE_MODEL, version: '5.0.0', async: true, kenBurns: true });
 });
 
 app.get('/download/:fileName', (req, res) => {
@@ -505,8 +566,8 @@ app.post('/render', (req, res) => {
   try {
     validatePayload(req.body);
 
-    if (!req.body.openaiApiKey) {
-      return res.status(400).json({ status: 'error', error: 'openaiApiKey is required' });
+    if (!req.body.openaiApiKey && !req.body.geminiApiKey) {
+      return res.status(400).json({ status: 'error', error: 'geminiApiKey or openaiApiKey is required' });
     }
 
     setJob(id, {
@@ -554,5 +615,5 @@ app.get('/status/:id', (req, res) => {
 
 app.listen(PORT, async () => {
   await ensureDir(DOWNLOAD_DIR);
-  console.log(`FFmpeg render service v4.0 (async) listening on ${PORT}`);
+  console.log(`FFmpeg render service v5.0 (NanoBanana 2 + Ken Burns) listening on ${PORT}`);
 });
