@@ -1,5 +1,5 @@
 /**
- * Railway FFmpeg Service v5.1 — NanoBanana 2 + OpenAI Fallback
+ * Railway FFmpeg Service v6.0 — Single Cinemagraph
  *
  * Architecture:
  *   POST /render      → validates, returns {status: "queued", renderId} immediately
@@ -7,19 +7,15 @@
  *   GET  /download/:f → serves the final MP4
  *   GET  /health      → service health check
  *
- * Image generation:
- *   Prefers Gemini NanoBanana 2 (gemini-3.1-flash-image-preview) if geminiApiKey provided.
- *   Falls back to OpenAI gpt-image-1 on ANY Gemini failure (auth, rate limit, safety, etc).
- *   IMPORTANT: NanoBanana 2 has NO free tier — billing must be enabled on the Google Cloud project.
- *
  * Why async:
- *   Railway has a 15-minute HTTP request limit. A 3-track video
+ *   Railway has a 15-minute HTTP request limit. A 3-track 60-minute video
  *   with server-side image generation exceeds that. The old synchronous
  *   /render endpoint caused SSL connection drops every time.
  *
  * n8n integration:
  *   Node 12 POSTs to /render, gets back renderId immediately.
- *   Polling loop checks GET /status/:id until complete or error.
+ *   New polling loop checks GET /status/:id until complete or error.
+ *   Same pattern as the Suno polling loop.
  */
 
 const express = require('express');
@@ -133,14 +129,13 @@ async function concatAudioFiles(audioPaths, outPath) {
 const GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-image-preview';
 const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 
-async function generateImage({ geminiApiKey, openaiApiKey, prompt, size, quality, imageSize, outPath }) {
+async function generateImage({ geminiApiKey, openaiApiKey, prompt, size, quality, outPath }) {
   // Prefer NanoBanana 2 (Gemini) if key provided
   if (geminiApiKey) {
     try {
-      return await generateImageGemini({ apiKey: geminiApiKey, prompt, imageSize, outPath });
+      return await generateImageGemini({ apiKey: geminiApiKey, prompt, outPath });
     } catch (err) {
       const msg = String(err?.message || '');
-      // Fall back to OpenAI on ANY Gemini failure (not just rate limits)
       if (openaiApiKey) {
         console.log(`[image] Gemini failed (${msg.slice(0, 100)}), falling back to OpenAI...`);
         return generateImageOpenAI({ apiKey: openaiApiKey, prompt, size, quality, outPath });
@@ -154,15 +149,8 @@ async function generateImage({ geminiApiKey, openaiApiKey, prompt, size, quality
   throw new Error('No image API key provided (need geminiApiKey or openaiApiKey)');
 }
 
-async function generateImageGemini({ apiKey, prompt, imageSize, outPath }) {
+async function generateImageGemini({ apiKey, prompt, outPath }) {
   const url = `${GEMINI_API_URL}/${GEMINI_IMAGE_MODEL}:generateContent`;
-  
-  // Map OpenAI-style sizes to Gemini imageSize values
-  // Gemini accepts: "512", "1K", "2K", "4K"
-  let geminiSize = '1K'; // default
-  if (imageSize === '512') geminiSize = '512';
-  else if (imageSize === '2K' || imageSize === '2048x2048') geminiSize = '2K';
-  else if (imageSize === '4K') geminiSize = '4K';
   
   async function callGemini(promptText, attempt = 1) {
     try {
@@ -177,7 +165,7 @@ async function generateImageGemini({ apiKey, prompt, imageSize, outPath }) {
           contents: [{ parts: [{ text: promptText }] }],
           generationConfig: {
             responseModalities: ['IMAGE', 'TEXT'],
-            imageConfig: { aspectRatio: '16:9', imageSize: geminiSize },
+            imageConfig: { aspectRatio: '16:9' },
           },
         },
         timeout: 60000,
@@ -196,13 +184,10 @@ async function generateImageGemini({ apiKey, prompt, imageSize, outPath }) {
       return null;
     } catch (err) {
       const status = err?.response?.status || 0;
-      const errMsg = err?.response?.data?.error?.message || err?.message || 'unknown';
-      console.log(`[image] Gemini error: HTTP ${status} — ${String(errMsg).slice(0, 200)}`);
-      // Retry on 429 (rate limit) and 503 (overloaded) with backoff
-      // 2 retries max, 30s cap — don't stall render for too long
+      // Retry on 429 (rate limit) and 503 (overloaded) with exponential backoff
       if ((status === 429 || status === 503) && attempt <= 2) {
         const waitSec = Math.min(15 * attempt, 30);
-        console.log(`[image] Gemini ${status}, waiting ${waitSec}s (attempt ${attempt}/2)...`);
+        console.log(`[image] Gemini ${status} rate limit, waiting ${waitSec}s (attempt ${attempt}/2)...`);
         await new Promise(r => setTimeout(r, waitSec * 1000));
         return callGemini(promptText, attempt + 1);
       }
@@ -425,6 +410,67 @@ function buildPublicUrl(filePath) {
   return `/download/${fileName}`;
 }
 
+
+// ============================================================
+// Runway Image-to-Video (Cinemagraph) via kie.ai
+// ============================================================
+
+async function makeImagePublic(imagePath, renderId) {
+  const fileName = `img_${renderId}_${path.basename(imagePath)}`;
+  const publicPath = path.join(DOWNLOAD_DIR, fileName);
+  await fsp.copyFile(imagePath, publicPath);
+  return buildPublicUrl(publicPath);
+}
+
+async function generateVideoClip({ kieApiKey, imageUrl, motionPrompt, duration = 10, outPath }) {
+  console.log(`[runway] Submitting i2v: "${motionPrompt.slice(0, 80)}..."`);
+  const submitRes = await axios({
+    method: 'POST',
+    url: 'https://api.kie.ai/api/v1/runway/generate',
+    headers: { 'Authorization': `Bearer ${kieApiKey}`, 'Content-Type': 'application/json' },
+    data: { prompt: motionPrompt, imageUrl, duration, quality: '720p', aspectRatio: '16:9', waterMark: '' },
+    timeout: 30000,
+  });
+  const taskId = submitRes.data?.data?.taskId;
+  if (!taskId) throw new Error('Runway no taskId: ' + JSON.stringify(submitRes.data).slice(0, 200));
+  console.log(`[runway] taskId: ${taskId}, polling...`);
+
+  for (let i = 0; i < 20; i++) {
+    await new Promise(r => setTimeout(r, 15000));
+    try {
+      const res = await axios({ method: 'GET',
+        url: `https://api.kie.ai/api/v1/runway/record-detail?taskId=${taskId}`,
+        headers: { 'Authorization': `Bearer ${kieApiKey}` }, timeout: 15000 });
+      const d = res.data?.data;
+      if (d?.state === 'success' && d?.videoInfo?.videoUrl) {
+        console.log(`[runway] Done! Downloading clip...`);
+        await downloadFile(d.videoInfo.videoUrl, outPath);
+        return true;
+      }
+      if (d?.state === 'fail') throw new Error('Runway failed: ' + (d?.failMsg || 'unknown'));
+      console.log(`[runway] ${d?.state || '?'} (${i + 1}/20)`);
+    } catch (e) { if (e.message.includes('Runway failed')) throw e; console.log(`[runway] poll err: ${e.message}`); }
+  }
+  throw new Error('Runway timeout after 20 polls');
+}
+
+async function createSegmentFromClip({ clipPath, audioPath, durationSeconds, resolution, outPath, fadeInSec = 0, fadeOutSec = 0 }) {
+  const [w, h] = String(resolution || '1920x1080').split('x').map(Number);
+  const vf = [`scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,format=yuv420p`];
+  if (fadeInSec > 0) vf.push(`fade=t=in:d=${fadeInSec}`);
+  if (fadeOutSec > 0) vf.push(`fade=t=out:st=${Math.max(0, durationSeconds - fadeOutSec)}:d=${fadeOutSec}`);
+  const af = [];
+  if (fadeInSec > 0) af.push(`afade=t=in:d=${fadeInSec}`);
+  if (fadeOutSec > 0) af.push(`afade=t=out:st=${Math.max(0, durationSeconds - fadeOutSec)}:d=${fadeOutSec}`);
+  const args = ['-y', '-stream_loop', '-1', '-i', clipPath, '-i', audioPath,
+    '-t', String(durationSeconds), '-map', '0:v', '-map', '1:a',
+    '-vf', vf.join(','), '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-threads', '2', '-shortest'];
+  if (af.length > 0) args.push('-af', af.join(','));
+  args.push(outPath);
+  await runFfmpeg(args);
+}
+
 // ============================================================
 // Background render worker
 // ============================================================
@@ -433,164 +479,94 @@ async function processRenderJob(id, body) {
   const tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), `render-${id}-`));
 
   try {
-    const { tracks, output = {}, crossfadeSec = 0, openaiApiKey, geminiApiKey } = body;
+    const { tracks, output = {}, crossfadeSec = 0, openaiApiKey, geminiApiKey, kieApiKey } = body;
     const imageSize = output.imageSize || '1536x1024';
     const imageQuality = output.imageQuality || 'low';
     const resolution = output.resolution || '1920x1080';
-    const fps = Number(output.fps || 24);
 
     await ensureDir(DOWNLOAD_DIR);
 
-    const segmentPaths = [];
-    const segmentDurations = [];
-    const generatedImages = [];
+    // ========== STEP 1: Download ALL audio from all tracks, concatenate ==========
+    setJob(id, { status: 'rendering', progress: 'downloading all audio', trackCount: tracks.length });
 
+    const allAudioParts = [];
     for (const [index, track] of tracks.entries()) {
-      const trackName = safeName(track.trackName, `track_${index + 1}`);
-      const audioPath = path.join(tempDir, `${String(index + 1).padStart(2, '0')}_${trackName}.mp3`);
-      const imagePath = path.join(tempDir, `${String(index + 1).padStart(2, '0')}_${trackName}.png`);
-      const segmentPath = path.join(tempDir, `${String(index + 1).padStart(2, '0')}_${trackName}.mp4`);
-
-      setJob(id, {
-        status: 'rendering',
-        progress: `track ${index + 1}/${tracks.length}: downloading audio`,
-        trackCount: tracks.length,
-      });
-
-      // Download all audio variations for this track
-      const audioUrls = Array.isArray(track.urls) && track.urls.length > 0
-        ? track.urls
-        : [track.url];
-      
-      const downloadedAudioPaths = [];
+      const audioUrls = Array.isArray(track.urls) && track.urls.length > 0 ? track.urls : [track.url];
       for (const [ai, aUrl] of audioUrls.entries()) {
-        const partPath = path.join(tempDir, `${String(index + 1).padStart(2, '0')}_${trackName}_part${ai + 1}.mp3`);
-        console.log(`[render:${id}] downloading audio ${ai + 1}/${audioUrls.length} for track ${index + 1}`);
+        const partPath = path.join(tempDir, `audio_t${index + 1}_v${ai + 1}.mp3`);
+        console.log(`[render:${id}] downloading track ${index + 1} variation ${ai + 1}`);
         await downloadFile(aUrl, partPath);
-        downloadedAudioPaths.push(partPath);
+        allAudioParts.push(partPath);
       }
+    }
 
-      // Concatenate all audio parts into one file
-      if (downloadedAudioPaths.length > 1) {
-        console.log(`[render:${id}] concatenating ${downloadedAudioPaths.length} audio parts for track ${index + 1}`);
-        await concatAudioFiles(downloadedAudioPaths, audioPath);
-      } else {
-        await fsp.copyFile(downloadedAudioPaths[0], audioPath);
+    const masterAudioPath = path.join(tempDir, 'master_audio.mp3');
+    console.log(`[render:${id}] concatenating ${allAudioParts.length} audio files...`);
+    await concatAudioFiles(allAudioParts, masterAudioPath);
+
+    const totalDuration = await probeDurationSeconds(masterAudioPath);
+    if (totalDuration <= 0) throw new Error('Could not determine total audio duration');
+    console.log(`[render:${id}] total audio: ${totalDuration.toFixed(0)}s (${(totalDuration / 60).toFixed(1)}min)`);
+
+    // ========== STEP 2: Generate ONE image ==========
+    setJob(id, { status: 'rendering', progress: 'generating image', trackCount: tracks.length });
+
+    const imagePrompt = tracks[0]?.imagePrompt || 'warm cozy artisan workspace, golden light, editorial illustration';
+    const imagePath = path.join(tempDir, 'scene.png');
+    console.log(`[render:${id}] generating image...`);
+    await generateImage({ geminiApiKey, openaiApiKey, prompt: imagePrompt, size: imageSize, quality: imageQuality, outPath: imagePath });
+
+    // ========== STEP 3: Generate cinemagraph OR Ken Burns ==========
+    const finalVideoPath = path.join(DOWNLOAD_DIR, `${id}.mp4`);
+    const motionPrompt = tracks[0]?.motionPrompt || '';
+    let usedCinemagraph = false;
+
+    if (kieApiKey && motionPrompt) {
+      setJob(id, { status: 'rendering', progress: 'generating living photo (Runway)', trackCount: tracks.length });
+      try {
+        const clipPath = path.join(tempDir, 'clip.mp4');
+        console.log(`[render:${id}] making image public for Runway...`);
+        const publicImageUrl = await makeImagePublic(imagePath, id);
+        console.log(`[render:${id}] image URL: ${publicImageUrl}`);
+
+        await generateVideoClip({ kieApiKey, imageUrl: publicImageUrl, motionPrompt, duration: 10, outPath: clipPath });
+
+        setJob(id, { status: 'rendering', progress: 'looping cinemagraph + muxing audio', trackCount: tracks.length });
+        console.log(`[render:${id}] looping clip for ${totalDuration.toFixed(0)}s...`);
+        await createSegmentFromClip({
+          clipPath, audioPath: masterAudioPath, durationSeconds: totalDuration,
+          resolution, outPath: finalVideoPath, fadeInSec: 0, fadeOutSec: 5,
+        });
+        usedCinemagraph = true;
+        console.log(`[render:${id}] cinemagraph complete!`);
+      } catch (runwayErr) {
+        console.log(`[render:${id}] Runway failed (${runwayErr.message}), falling back to Ken Burns`);
       }
+    }
 
-      setJob(id, {
-        status: 'rendering',
-        progress: `track ${index + 1}/${tracks.length}: generating image`,
-        trackCount: tracks.length,
-      });
-
-      console.log(`[render:${id}] generating image for track ${index + 1}`);
-      // Space out Gemini API calls to avoid 429 rate limits
-      if (index > 0 && geminiApiKey) {
-        console.log(`[render:${id}] waiting 10s before next image (rate limit spacing)...`);
-        await new Promise(r => setTimeout(r, 10000));
-      }
-      await generateImage({
-        geminiApiKey,
-        openaiApiKey,
-        prompt: track.imagePrompt,
-        size: imageSize,
-        quality: imageQuality,
-        imageSize: output.geminiImageSize || '1K',
-        outPath: imagePath,
-      });
-
-      const requestedDuration = Number(track.durationSeconds || 0);
-      const probedAudioDuration = await probeDurationSeconds(audioPath);
-      // Use actual audio duration (sum of all variations) — no more looping
-      const durationSeconds = probedAudioDuration > 0 ? probedAudioDuration : requestedDuration;
-      if (durationSeconds <= 0) {
-        throw new Error(`Could not determine duration for track ${index + 1}`);
-      }
-
-      console.log(`[render:${id}] track ${index + 1}: ${audioUrls.length} variations, total audio ${probedAudioDuration.toFixed(0)}s`);
-
-      setJob(id, {
-        status: 'rendering',
-        progress: `track ${index + 1}/${tracks.length}: encoding video segment`,
-        trackCount: tracks.length,
-      });
-
-      console.log(`[render:${id}] building segment video for track ${index + 1}`);
-      
-      // Fade logic: 3s fade-in on first track, 3s fade-out on last track
-      // Middle tracks get both fade-in and fade-out for smooth transitions
-      const isFirst = index === 0;
-      const isLast = index === tracks.length - 1;
-      const FADE_SEC = 3;
-      
+    if (!usedCinemagraph) {
+      setJob(id, { status: 'rendering', progress: 'encoding Ken Burns video', trackCount: tracks.length });
+      console.log(`[render:${id}] Ken Burns fallback for ${totalDuration.toFixed(0)}s`);
       await createSegmentVideo({
-        imagePath,
-        audioPath,
-        durationSeconds,
-        resolution,
-        fps,
-        outPath: segmentPath,
-        fadeInSec: isFirst ? 0 : FADE_SEC,
-        fadeOutSec: isLast ? FADE_SEC + 2 : FADE_SEC,
-      });
-
-      segmentPaths.push(segmentPath);
-      segmentDurations.push(durationSeconds);
-      generatedImages.push({
-        trackNumber: track.trackNumber || index + 1,
-        trackName: track.trackName || '',
-        prompt: track.imagePrompt,
-        durationSeconds,
+        imagePath, audioPath: masterAudioPath, durationSeconds: totalDuration,
+        resolution, fps: 24, outPath: finalVideoPath, fadeInSec: 0, fadeOutSec: 5,
       });
     }
 
-    setJob(id, {
-      status: 'rendering',
-      progress: 'concatenating segments',
-      trackCount: tracks.length,
-    });
-
-    const finalName = `${id}.mp4`;
-    const finalPath = path.join(DOWNLOAD_DIR, finalName);
-
-    if (segmentPaths.length === 1 || Number(crossfadeSec) <= 0) {
-      console.log(`[render:${id}] concatenating with hard cuts`);
-      await concatSegmentsHardCut(segmentPaths, finalPath);
-    } else {
-      console.log(`[render:${id}] concatenating with crossfades (${crossfadeSec}s)`);
-      await concatSegmentsCrossfade(segmentPaths, segmentDurations, Number(crossfadeSec), finalPath);
-    }
-
-    const publicUrl = buildPublicUrl(finalPath);
+    const publicUrl = buildPublicUrl(finalVideoPath);
     console.log(`[render:${id}] complete: ${publicUrl}`);
-
-    setJob(id, {
-      status: 'complete',
-      url: publicUrl,
-      trackCount: tracks.length,
-      generatedImages,
-    });
+    setJob(id, { status: 'complete', url: publicUrl, trackCount: tracks.length });
 
   } catch (error) {
     console.error(`[render:${id}] FAILED:`, error?.message || error);
-    setJob(id, {
-      status: 'error',
-      error: String(error?.message || 'Unknown render error').slice(0, 500),
-    });
+    setJob(id, { status: 'error', error: String(error?.message || 'Unknown render error').slice(0, 500) });
   } finally {
-    try {
-      await fsp.rm(tempDir, { recursive: true, force: true });
-    } catch (_) { /* ignore */ }
+    try { await fsp.rm(tempDir, { recursive: true, force: true }); } catch (_) {}
   }
 }
 
-// ============================================================
-// API Endpoints
-// ============================================================
-
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, imageModel: GEMINI_IMAGE_MODEL, fallbackModel: OPENAI_IMAGE_MODEL, version: '5.1.0', async: true, kenBurns: true });
+  res.json({ ok: true, imageModel: GEMINI_IMAGE_MODEL, fallbackModel: OPENAI_IMAGE_MODEL, version: '6.0.0', async: true, cinemagraph: true });
 });
 
 app.get('/download/:fileName', (req, res) => {
@@ -610,6 +586,9 @@ app.post('/render', (req, res) => {
 
     if (!req.body.openaiApiKey && !req.body.geminiApiKey) {
       return res.status(400).json({ status: 'error', error: 'geminiApiKey or openaiApiKey is required' });
+    }
+    if (req.body.kieApiKey && req.body.tracks?.[0]?.motionPrompt) {
+      console.log('[render] Cinemagraph mode: single living photo for full duration');
     }
 
     setJob(id, {
@@ -657,5 +636,5 @@ app.get('/status/:id', (req, res) => {
 
 app.listen(PORT, async () => {
   await ensureDir(DOWNLOAD_DIR);
-  console.log(`FFmpeg render service v5.1 (NanoBanana 2 + Ken Burns + OpenAI fallback) listening on ${PORT}`);
+  console.log(`FFmpeg render service v6.0 (Cinemagraph + Ken Burns fallback) listening on ${PORT}`);
 });
