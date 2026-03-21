@@ -130,9 +130,20 @@ const GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-image-preview';
 const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 
 async function generateImage({ geminiApiKey, openaiApiKey, prompt, size, quality, outPath }) {
-  // Prefer NanoBanana 2 (Gemini) if key provided, fallback to OpenAI
+  // Prefer NanoBanana 2 (Gemini) if key provided
   if (geminiApiKey) {
-    return generateImageGemini({ apiKey: geminiApiKey, prompt, outPath });
+    try {
+      return await generateImageGemini({ apiKey: geminiApiKey, prompt, outPath });
+    } catch (err) {
+      const status = err?.response?.status || 0;
+      const msg = String(err?.message || '');
+      // If Gemini rate-limited after all retries, fall back to OpenAI
+      if ((status === 429 || status === 503 || msg.includes('429')) && openaiApiKey) {
+        console.log(`[image] Gemini exhausted rate limit, falling back to OpenAI...`);
+        return generateImageOpenAI({ apiKey: openaiApiKey, prompt, size, quality, outPath });
+      }
+      throw err;
+    }
   }
   if (openaiApiKey) {
     return generateImageOpenAI({ apiKey: openaiApiKey, prompt, size, quality, outPath });
@@ -177,7 +188,7 @@ async function generateImageGemini({ apiKey, prompt, outPath }) {
       const status = err?.response?.status || 0;
       // Retry on 429 (rate limit) and 503 (overloaded) with exponential backoff
       if ((status === 429 || status === 503) && attempt <= 5) {
-        const waitSec = Math.min(15 * attempt, 60);
+        const waitSec = Math.min(30 * attempt, 90);
         console.log(`[image] Gemini ${status} rate limit, waiting ${waitSec}s (attempt ${attempt}/5)...`);
         await new Promise(r => setTimeout(r, waitSec * 1000));
         return callGemini(promptText, attempt + 1);
@@ -461,10 +472,10 @@ async function processRenderJob(id, body) {
       });
 
       console.log(`[render:${id}] generating image for track ${index + 1}`);
-      // Space out Gemini API calls to avoid 429 rate limits (free tier: ~10/min)
+      // Space out Gemini API calls to avoid 429 rate limits (free tier: ~2-5/min)
       if (index > 0 && geminiApiKey) {
-        console.log(`[render:${id}] waiting 15s before next image (rate limit spacing)...`);
-        await new Promise(r => setTimeout(r, 15000));
+        console.log(`[render:${id}] waiting 30s before next image (rate limit spacing)...`);
+        await new Promise(r => setTimeout(r, 30000));
       }
       await generateImage({
         geminiApiKey,
