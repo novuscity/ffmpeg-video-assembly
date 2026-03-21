@@ -1,5 +1,5 @@
 /**
- * Railway FFmpeg Service v4.0 — Async Render
+ * Railway FFmpeg Service v5.1 — NanoBanana 2 + OpenAI Fallback
  *
  * Architecture:
  *   POST /render      → validates, returns {status: "queued", renderId} immediately
@@ -7,15 +7,19 @@
  *   GET  /download/:f → serves the final MP4
  *   GET  /health      → service health check
  *
+ * Image generation:
+ *   Prefers Gemini NanoBanana 2 (gemini-3.1-flash-image-preview) if geminiApiKey provided.
+ *   Falls back to OpenAI gpt-image-1 on ANY Gemini failure (auth, rate limit, safety, etc).
+ *   IMPORTANT: NanoBanana 2 has NO free tier — billing must be enabled on the Google Cloud project.
+ *
  * Why async:
- *   Railway has a 15-minute HTTP request limit. A 3-track 60-minute video
+ *   Railway has a 15-minute HTTP request limit. A 3-track video
  *   with server-side image generation exceeds that. The old synchronous
  *   /render endpoint caused SSL connection drops every time.
  *
  * n8n integration:
  *   Node 12 POSTs to /render, gets back renderId immediately.
- *   New polling loop checks GET /status/:id until complete or error.
- *   Same pattern as the Suno polling loop.
+ *   Polling loop checks GET /status/:id until complete or error.
  */
 
 const express = require('express');
@@ -129,17 +133,16 @@ async function concatAudioFiles(audioPaths, outPath) {
 const GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-image-preview';
 const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 
-async function generateImage({ geminiApiKey, openaiApiKey, prompt, size, quality, outPath }) {
+async function generateImage({ geminiApiKey, openaiApiKey, prompt, size, quality, imageSize, outPath }) {
   // Prefer NanoBanana 2 (Gemini) if key provided
   if (geminiApiKey) {
     try {
-      return await generateImageGemini({ apiKey: geminiApiKey, prompt, outPath });
+      return await generateImageGemini({ apiKey: geminiApiKey, prompt, imageSize, outPath });
     } catch (err) {
-      const status = err?.response?.status || 0;
       const msg = String(err?.message || '');
-      // If Gemini rate-limited after all retries, fall back to OpenAI
-      if ((status === 429 || status === 503 || msg.includes('429')) && openaiApiKey) {
-        console.log(`[image] Gemini exhausted rate limit, falling back to OpenAI...`);
+      // Fall back to OpenAI on ANY Gemini failure (not just rate limits)
+      if (openaiApiKey) {
+        console.log(`[image] Gemini failed (${msg.slice(0, 100)}), falling back to OpenAI...`);
         return generateImageOpenAI({ apiKey: openaiApiKey, prompt, size, quality, outPath });
       }
       throw err;
@@ -151,8 +154,15 @@ async function generateImage({ geminiApiKey, openaiApiKey, prompt, size, quality
   throw new Error('No image API key provided (need geminiApiKey or openaiApiKey)');
 }
 
-async function generateImageGemini({ apiKey, prompt, outPath }) {
+async function generateImageGemini({ apiKey, prompt, imageSize, outPath }) {
   const url = `${GEMINI_API_URL}/${GEMINI_IMAGE_MODEL}:generateContent`;
+  
+  // Map OpenAI-style sizes to Gemini imageSize values
+  // Gemini accepts: "512", "1K", "2K", "4K"
+  let geminiSize = '1K'; // default
+  if (imageSize === '512') geminiSize = '512';
+  else if (imageSize === '2K' || imageSize === '2048x2048') geminiSize = '2K';
+  else if (imageSize === '4K') geminiSize = '4K';
   
   async function callGemini(promptText, attempt = 1) {
     try {
@@ -167,7 +177,7 @@ async function generateImageGemini({ apiKey, prompt, outPath }) {
           contents: [{ parts: [{ text: promptText }] }],
           generationConfig: {
             responseModalities: ['IMAGE', 'TEXT'],
-            imageConfig: { aspectRatio: '16:9' },
+            imageConfig: { aspectRatio: '16:9', imageSize: geminiSize },
           },
         },
         timeout: 60000,
@@ -186,10 +196,13 @@ async function generateImageGemini({ apiKey, prompt, outPath }) {
       return null;
     } catch (err) {
       const status = err?.response?.status || 0;
-      // Retry on 429 (rate limit) and 503 (overloaded) with exponential backoff
-      if ((status === 429 || status === 503) && attempt <= 5) {
-        const waitSec = Math.min(30 * attempt, 90);
-        console.log(`[image] Gemini ${status} rate limit, waiting ${waitSec}s (attempt ${attempt}/5)...`);
+      const errMsg = err?.response?.data?.error?.message || err?.message || 'unknown';
+      console.log(`[image] Gemini error: HTTP ${status} — ${String(errMsg).slice(0, 200)}`);
+      // Retry on 429 (rate limit) and 503 (overloaded) with backoff
+      // 2 retries max, 30s cap — don't stall render for too long
+      if ((status === 429 || status === 503) && attempt <= 2) {
+        const waitSec = Math.min(15 * attempt, 30);
+        console.log(`[image] Gemini ${status}, waiting ${waitSec}s (attempt ${attempt}/2)...`);
         await new Promise(r => setTimeout(r, waitSec * 1000));
         return callGemini(promptText, attempt + 1);
       }
@@ -472,10 +485,10 @@ async function processRenderJob(id, body) {
       });
 
       console.log(`[render:${id}] generating image for track ${index + 1}`);
-      // Space out Gemini API calls to avoid 429 rate limits (free tier: ~2-5/min)
+      // Space out Gemini API calls to avoid 429 rate limits
       if (index > 0 && geminiApiKey) {
-        console.log(`[render:${id}] waiting 30s before next image (rate limit spacing)...`);
-        await new Promise(r => setTimeout(r, 30000));
+        console.log(`[render:${id}] waiting 10s before next image (rate limit spacing)...`);
+        await new Promise(r => setTimeout(r, 10000));
       }
       await generateImage({
         geminiApiKey,
@@ -483,6 +496,7 @@ async function processRenderJob(id, body) {
         prompt: track.imagePrompt,
         size: imageSize,
         quality: imageQuality,
+        imageSize: output.geminiImageSize || '1K',
         outPath: imagePath,
       });
 
@@ -576,7 +590,7 @@ async function processRenderJob(id, body) {
 // ============================================================
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, imageModel: GEMINI_IMAGE_MODEL, fallbackModel: OPENAI_IMAGE_MODEL, version: '5.0.0', async: true, kenBurns: true });
+  res.json({ ok: true, imageModel: GEMINI_IMAGE_MODEL, fallbackModel: OPENAI_IMAGE_MODEL, version: '5.1.0', async: true, kenBurns: true });
 });
 
 app.get('/download/:fileName', (req, res) => {
@@ -643,5 +657,5 @@ app.get('/status/:id', (req, res) => {
 
 app.listen(PORT, async () => {
   await ensureDir(DOWNLOAD_DIR);
-  console.log(`FFmpeg render service v5.0 (NanoBanana 2 + Ken Burns) listening on ${PORT}`);
+  console.log(`FFmpeg render service v5.1 (NanoBanana 2 + Ken Burns + OpenAI fallback) listening on ${PORT}`);
 });
