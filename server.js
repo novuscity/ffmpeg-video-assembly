@@ -129,11 +129,11 @@ async function concatAudioFiles(audioPaths, outPath) {
 const GEMINI_IMAGE_MODEL = 'gemini-3.1-flash-image-preview';
 const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 
-async function generateImage({ geminiApiKey, openaiApiKey, prompt, size, quality, outPath }) {
+async function generateImage({ geminiApiKey, openaiApiKey, prompt, size, quality, imageSize, outPath }) {
   // Prefer NanoBanana 2 (Gemini) if key provided
   if (geminiApiKey) {
     try {
-      return await generateImageGemini({ apiKey: geminiApiKey, prompt, outPath });
+      return await generateImageGemini({ apiKey: geminiApiKey, prompt, imageSize, outPath });
     } catch (err) {
       const msg = String(err?.message || '');
       if (openaiApiKey) {
@@ -149,8 +149,11 @@ async function generateImage({ geminiApiKey, openaiApiKey, prompt, size, quality
   throw new Error('No image API key provided (need geminiApiKey or openaiApiKey)');
 }
 
-async function generateImageGemini({ apiKey, prompt, outPath }) {
+async function generateImageGemini({ apiKey, prompt, imageSize, outPath }) {
   const url = `${GEMINI_API_URL}/${GEMINI_IMAGE_MODEL}:generateContent`;
+  
+  // Map to Gemini imageSize values: "512", "1K", "2K", "4K"
+  const geminiSize = imageSize || '1K';
   
   async function callGemini(promptText, attempt = 1) {
     try {
@@ -165,7 +168,7 @@ async function generateImageGemini({ apiKey, prompt, outPath }) {
           contents: [{ parts: [{ text: promptText }] }],
           generationConfig: {
             responseModalities: ['IMAGE', 'TEXT'],
-            imageConfig: { aspectRatio: '16:9' },
+            imageConfig: { aspectRatio: '16:9', imageSize: geminiSize },
           },
         },
         timeout: 60000,
@@ -514,7 +517,7 @@ async function processRenderJob(id, body) {
     const imagePrompt = tracks[0]?.imagePrompt || 'warm cozy artisan workspace, golden light, editorial illustration';
     const imagePath = path.join(tempDir, 'scene.png');
     console.log(`[render:${id}] generating image...`);
-    await generateImage({ geminiApiKey, openaiApiKey, prompt: imagePrompt, size: imageSize, quality: imageQuality, outPath: imagePath });
+    await generateImage({ geminiApiKey, openaiApiKey, prompt: imagePrompt, size: imageSize, quality: imageQuality, imageSize: output.geminiImageSize || '1K', outPath: imagePath });
 
     // ========== STEP 3: Generate cinemagraph OR Ken Burns ==========
     const finalVideoPath = path.join(DOWNLOAD_DIR, `${id}.mp4`);
