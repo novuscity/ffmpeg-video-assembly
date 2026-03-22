@@ -524,6 +524,9 @@ async function processRenderJob(id, body) {
     const motionPrompt = tracks[0]?.motionPrompt || '';
     let usedCinemagraph = false;
 
+    // Log the cinemagraph decision explicitly so we can diagnose failures
+    console.log(`[render:${id}] Cinemagraph check: kieApiKey=${kieApiKey ? 'SET(' + kieApiKey.slice(0,8) + '...)' : 'EMPTY'}, motionPrompt=${motionPrompt ? '"' + motionPrompt.slice(0,60) + '..."' : 'EMPTY'}`);
+
     if (kieApiKey && motionPrompt) {
       setJob(id, { status: 'rendering', progress: 'generating living photo (Runway)', trackCount: tracks.length });
       try {
@@ -532,10 +535,21 @@ async function processRenderJob(id, body) {
         const publicImageUrl = await makeImagePublic(imagePath, id);
         console.log(`[render:${id}] image URL: ${publicImageUrl}`);
 
+        // Verify the URL is absolute — Runway can't fetch relative paths
+        if (!publicImageUrl.startsWith('http')) {
+          throw new Error(`Public image URL is relative ("${publicImageUrl}") — set PUBLIC_BASE_URL or RAILWAY_PUBLIC_DOMAIN env var in Railway`);
+        }
+
         await generateVideoClip({ kieApiKey, imageUrl: publicImageUrl, motionPrompt, duration: 10, outPath: clipPath });
 
+        // Verify the clip was actually downloaded
+        const clipStats = await fsp.stat(clipPath).catch(() => null);
+        if (!clipStats || clipStats.size < 1000) {
+          throw new Error(`Runway clip file missing or too small (${clipStats?.size || 0} bytes)`);
+        }
+
         setJob(id, { status: 'rendering', progress: 'looping cinemagraph + muxing audio', trackCount: tracks.length });
-        console.log(`[render:${id}] looping clip for ${totalDuration.toFixed(0)}s...`);
+        console.log(`[render:${id}] looping ${(clipStats.size / 1024).toFixed(0)}KB clip for ${totalDuration.toFixed(0)}s...`);
         await createSegmentFromClip({
           clipPath, audioPath: masterAudioPath, durationSeconds: totalDuration,
           resolution, outPath: finalVideoPath, fadeInSec: 0, fadeOutSec: 5,
@@ -543,8 +557,12 @@ async function processRenderJob(id, body) {
         usedCinemagraph = true;
         console.log(`[render:${id}] cinemagraph complete!`);
       } catch (runwayErr) {
-        console.log(`[render:${id}] Runway failed (${runwayErr.message}), falling back to Ken Burns`);
+        console.error(`[render:${id}] CINEMAGRAPH FAILED: ${runwayErr.message}`);
+        console.log(`[render:${id}] Falling back to Ken Burns...`);
+        setJob(id, { status: 'rendering', progress: 'cinemagraph failed, using Ken Burns fallback', trackCount: tracks.length });
       }
+    } else {
+      console.log(`[render:${id}] Skipping cinemagraph — ${!kieApiKey ? 'no kieApiKey' : 'no motionPrompt'}`);
     }
 
     if (!usedCinemagraph) {
@@ -557,8 +575,8 @@ async function processRenderJob(id, body) {
     }
 
     const publicUrl = buildPublicUrl(finalVideoPath);
-    console.log(`[render:${id}] complete: ${publicUrl}`);
-    setJob(id, { status: 'complete', url: publicUrl, trackCount: tracks.length });
+    console.log(`[render:${id}] complete (${usedCinemagraph ? 'cinemagraph' : 'Ken Burns'}): ${publicUrl}`);
+    setJob(id, { status: 'complete', url: publicUrl, trackCount: tracks.length, renderMethod: usedCinemagraph ? 'cinemagraph' : 'kenburns' });
 
   } catch (error) {
     console.error(`[render:${id}] FAILED:`, error?.message || error);
@@ -569,7 +587,7 @@ async function processRenderJob(id, body) {
 }
 
 app.get('/health', (_req, res) => {
-  res.json({ ok: true, imageModel: GEMINI_IMAGE_MODEL, fallbackModel: OPENAI_IMAGE_MODEL, version: '6.0.0', async: true, cinemagraph: true });
+  res.json({ ok: true, imageModel: GEMINI_IMAGE_MODEL, fallbackModel: OPENAI_IMAGE_MODEL, version: '6.1.0', async: true, cinemagraph: true });
 });
 
 app.get('/download/:fileName', (req, res) => {
@@ -634,10 +652,11 @@ app.get('/status/:id', (req, res) => {
     error: job.error || null,
     trackCount: job.trackCount || null,
     generatedImages: job.generatedImages || null,
+    renderMethod: job.renderMethod || null,
   });
 });
 
 app.listen(PORT, async () => {
   await ensureDir(DOWNLOAD_DIR);
-  console.log(`FFmpeg render service v6.0 (Cinemagraph + Ken Burns fallback) listening on ${PORT}`);
+  console.log(`FFmpeg render service v6.1 (Cinemagraph + Ken Burns fallback) listening on ${PORT}`);
 });
