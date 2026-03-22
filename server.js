@@ -84,7 +84,8 @@ function validatePayload(body) {
     const hasUrls = Array.isArray(track.urls) && track.urls.length > 0;
     const hasUrl = track.url && typeof track.url === 'string';
     if (!hasUrls && !hasUrl) throw new Error(`tracks[${i}] needs url or urls[]`);
-    if (!track.imagePrompt) throw new Error(`tracks[${i}].imagePrompt is required`);
+    // v12.0+: Only track 1 needs imagePrompt (single image per video)
+    if (i === 0 && !track.imagePrompt) throw new Error(`tracks[0].imagePrompt is required`);
     // durationSeconds is now optional — 0 means "use actual audio length"
   }
 }
