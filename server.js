@@ -460,19 +460,50 @@ async function generateVideoClip({ kieApiKey, imageUrl, motionPrompt, duration =
 
 async function createSegmentFromClip({ clipPath, audioPath, durationSeconds, resolution, outPath, fadeInSec = 0, fadeOutSec = 0 }) {
   const [w, h] = String(resolution || '1920x1080').split('x').map(Number);
+  const xfadeDuration = 1; // 1s crossfade hides the loop seam
+
+  // Step A: Create seamless loop by crossfading end→start of clip
+  const clipDuration = await probeDurationSeconds(clipPath);
+  const seamlessPath = path.join(path.dirname(clipPath), 'seamless_loop.mp4');
+
+  if (clipDuration > xfadeDuration * 2) {
+    const offset = Math.max(0, clipDuration - xfadeDuration);
+    console.log(`[cinemagraph] creating seamless loop: ${clipDuration.toFixed(1)}s clip, ${xfadeDuration}s crossfade at offset=${offset}`);
+    await runFfmpeg([
+      '-y',
+      '-i', clipPath,
+      '-i', clipPath,
+      '-filter_complex',
+      `[0:v][1:v]xfade=transition=fade:duration=${xfadeDuration}:offset=${offset}[v]`,
+      '-map', '[v]',
+      '-c:v', 'libx264', '-preset', 'ultrafast',
+      '-pix_fmt', 'yuv420p',
+      '-threads', '2',
+      seamlessPath,
+    ]);
+  } else {
+    console.log(`[cinemagraph] clip too short (${clipDuration.toFixed(1)}s) for crossfade, using raw loop`);
+    await fsp.copyFile(clipPath, seamlessPath);
+  }
+
+  // Step B: Loop the seamless clip for the full duration, mux with audio
+  console.log(`[cinemagraph] looping seamless clip for ${durationSeconds.toFixed(0)}s...`);
   const vf = [`scale=${w}:${h}:force_original_aspect_ratio=decrease,pad=${w}:${h}:(ow-iw)/2:(oh-ih)/2,format=yuv420p`];
   if (fadeInSec > 0) vf.push(`fade=t=in:d=${fadeInSec}`);
   if (fadeOutSec > 0) vf.push(`fade=t=out:st=${Math.max(0, durationSeconds - fadeOutSec)}:d=${fadeOutSec}`);
   const af = [];
   if (fadeInSec > 0) af.push(`afade=t=in:d=${fadeInSec}`);
   if (fadeOutSec > 0) af.push(`afade=t=out:st=${Math.max(0, durationSeconds - fadeOutSec)}:d=${fadeOutSec}`);
-  const args = ['-y', '-stream_loop', '-1', '-i', clipPath, '-i', audioPath,
+  const args = ['-y', '-stream_loop', '-1', '-i', seamlessPath, '-i', audioPath,
     '-t', String(durationSeconds), '-map', '0:v', '-map', '1:a',
     '-vf', vf.join(','), '-c:v', 'libx264', '-preset', 'ultrafast', '-pix_fmt', 'yuv420p',
     '-c:a', 'aac', '-b:a', '192k', '-ar', '48000', '-threads', '2', '-shortest'];
   if (af.length > 0) args.push('-af', af.join(','));
   args.push(outPath);
   await runFfmpeg(args);
+
+  // Clean up intermediate file
+  try { await fsp.unlink(seamlessPath); } catch(_) {}
 }
 
 // ============================================================
