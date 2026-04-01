@@ -289,22 +289,19 @@ async function runFfmpeg(args) {
   });
 }
 
-function buildImageVideoFilter(resolution, durationSeconds) {
+function buildImageVideoFilter(resolution) {
   const [width, height] = String(resolution || '1920x1080').split('x').map(Number);
-  const totalFrames = Math.ceil((durationSeconds || 120) * 24);
-  
-  // Ken Burns: slow zoom from 1.0x to 1.15x over the full duration
-  // zoompan creates motion from a still image — much more engaging than static
-  // We generate at higher resolution (scale up first) then zoompan crops/zooms within it
+
+  // Static image fallback: scale to target resolution and hold still
   return [
-    `scale=${width * 2}:${height * 2}`,
-    `zoompan=z='min(zoom+0.00015,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=${totalFrames}:s=${width}x${height}:fps=24`,
+    `scale=${width}:${height}:force_original_aspect_ratio=decrease`,
+    `pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2`,
     'format=yuv420p',
   ].join(',');
 }
 
 async function createSegmentVideo({ imagePath, audioPath, durationSeconds, resolution, fps, outPath, fadeInSec = 0, fadeOutSec = 0 }) {
-  const vf = buildImageVideoFilter(resolution, durationSeconds);
+  const vf = buildImageVideoFilter(resolution);
   
   // Build audio filter for fades
   const audioFilters = [];
@@ -316,7 +313,7 @@ async function createSegmentVideo({ imagePath, audioPath, durationSeconds, resol
     audioFilters.push(`afade=t=out:st=${fadeStart}:d=${fadeOutSec}`);
   }
 
-  // Build video filter — Ken Burns zoompan + fades
+  // Build video filter — static image + fades
   const videoFilters = [vf];
   if (fadeInSec > 0) {
     videoFilters.push(`fade=t=in:d=${fadeInSec}`);
@@ -551,7 +548,7 @@ async function processRenderJob(id, body) {
     console.log(`[render:${id}] generating image...`);
     await generateImage({ geminiApiKey, openaiApiKey, prompt: imagePrompt, size: imageSize, quality: imageQuality, imageSize: output.geminiImageSize || '1K', outPath: imagePath });
 
-    // ========== STEP 3: Generate cinemagraph OR Ken Burns ==========
+    // ========== STEP 3: Generate cinemagraph OR static image ==========
     const finalVideoPath = path.join(DOWNLOAD_DIR, `${id}.mp4`);
     const motionPrompt = tracks[0]?.motionPrompt || '';
     let usedCinemagraph = false;
@@ -590,16 +587,16 @@ async function processRenderJob(id, body) {
         console.log(`[render:${id}] cinemagraph complete!`);
       } catch (runwayErr) {
         console.error(`[render:${id}] CINEMAGRAPH FAILED: ${runwayErr.message}`);
-        console.log(`[render:${id}] Falling back to Ken Burns...`);
-        setJob(id, { status: 'rendering', progress: 'cinemagraph failed, using Ken Burns fallback', trackCount: tracks.length });
+        console.log(`[render:${id}] Falling back to static image...`);
+        setJob(id, { status: 'rendering', progress: 'cinemagraph failed, using static image fallback', trackCount: tracks.length });
       }
     } else {
       console.log(`[render:${id}] Skipping cinemagraph — ${!kieApiKey ? 'no kieApiKey' : 'no motionPrompt'}`);
     }
 
     if (!usedCinemagraph) {
-      setJob(id, { status: 'rendering', progress: 'encoding Ken Burns video', trackCount: tracks.length });
-      console.log(`[render:${id}] Ken Burns fallback for ${totalDuration.toFixed(0)}s`);
+      setJob(id, { status: 'rendering', progress: 'encoding static image video', trackCount: tracks.length });
+      console.log(`[render:${id}] static image fallback for ${totalDuration.toFixed(0)}s`);
       await createSegmentVideo({
         imagePath, audioPath: masterAudioPath, durationSeconds: totalDuration,
         resolution, fps: 24, outPath: finalVideoPath, fadeInSec: 0, fadeOutSec: 5,
@@ -607,8 +604,8 @@ async function processRenderJob(id, body) {
     }
 
     const publicUrl = buildPublicUrl(finalVideoPath);
-    console.log(`[render:${id}] complete (${usedCinemagraph ? 'cinemagraph' : 'Ken Burns'}): ${publicUrl}`);
-    setJob(id, { status: 'complete', url: publicUrl, trackCount: tracks.length, renderMethod: usedCinemagraph ? 'cinemagraph' : 'kenburns' });
+    console.log(`[render:${id}] complete (${usedCinemagraph ? 'cinemagraph' : 'static image'}): ${publicUrl}`);
+    setJob(id, { status: 'complete', url: publicUrl, trackCount: tracks.length, renderMethod: usedCinemagraph ? 'cinemagraph' : 'static-image' });
 
   } catch (error) {
     console.error(`[render:${id}] FAILED:`, error?.message || error);
@@ -690,5 +687,5 @@ app.get('/status/:id', (req, res) => {
 
 app.listen(PORT, async () => {
   await ensureDir(DOWNLOAD_DIR);
-  console.log(`FFmpeg render service v6.1 (Cinemagraph + Ken Burns fallback) listening on ${PORT}`);
+  console.log(`FFmpeg render service v6.1 (Cinemagraph + static image fallback) listening on ${PORT}`);
 });
